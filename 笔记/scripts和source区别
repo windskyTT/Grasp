@@ -1,0 +1,76 @@
+# scripts source 两个文件夹下的文件有什么区别，里面都有RL相关代码，scripts中的和source/Grasp/Grasp/algo中的有什么区别
+
+## 📁 文件夹结构对比
+
+### **scripts 文件夹** - 标准化训练脚本
+这是通用的**入口脚本**，用于与 Isaac Lab 环境交互：
+- **random_agent.py / zero_agent.py**: 基础测试脚本（随机/零动作代理）
+- **list_envs.py**: 列举所有可用环境
+- **`rl_games/train.py`**: 使用 **RL-Games** 框架训练（通用、社区维护的RL库）
+- **`rsl_rl/train.py`**: 使用 **RSL-RL** 框架训练（Legged Robots 针对的RL库）
+
+### **algo** - 项目定制算法
+这是**抓取任务特定的算法实现**：
+- **`ppo_onestep/`**: 定制的 **PPO 单步规划器** 实现（专为你的抓取任务设计）
+- **`ppo_teacher_未改/` / `ppo_student_未改/`**: 教师-学生模型的 PPO 实现
+
+---
+
+## 🔑 核心区别
+
+| 方面 | scripts中的RL框架 | source/Grasp中的algo |
+|------|-----------------|-------------------|
+| **用途** | 通用RL训练框架 | 抓取任务特定算法 |
+| **来源** | Isaac Lab官方提供 | 项目自主开发 |
+| **框架** | RL-Games / RSL-RL | 自定义PPO实现 |
+| **配置** | 通过CLI参数和config entry point | 通过YAML配置（PPOOneStep.yaml） |
+| **关键代码** | train.py / play.py | `ppo_onestep.PPO` 类 |
+
+---
+
+## 💡 使用场景
+
+**scripts（RL-Games/RSL-RL）**：
+- ✅ 标准的多环境并行训练
+- ✅ 通用PPO/强化学习算法
+- ✅ 易于与其他Isaac Lab任务配合
+
+**source/Grasp/algo（PPO OneStep）**：
+- ✅ 专针对"单步规划器"的定制实现（`nsteps: 1`）
+- ✅ 支持点云处理（`pc_shape`, `pc_emb_dim`）
+- ✅ 支持教师-学生蒸馏训练
+- ✅ 与抓取特定的奖励和观察空间集成
+
+**修改文件** 中的 run_rl_grasp.py 是项目的**主训练入口**，它加载自定义的 `ppo_onestep` 算法。
+
+
+**教师学生策略应该放在 algo 下**
+
+理由是：
+
+1. **核心算法实现** → algo  
+   这里已经有：
+   - `ppo_onestep/`
+   - `ppo_student_未改/`  
+   - `ppo_teacher_未改/`
+   
+   你的教师学生策略应该在这里作为一个新的模块，比如 `teacher_student/` 或类似的结构。
+
+2. **使用脚本** → scripts 下  
+   - 如果要写训练脚本，在 rsl_rl 或 rl_games 下
+   - 如果要写演示脚本，在 scripts 根目录
+
+**建议的结构：**
+```
+source/Grasp/Grasp/algo/
+    └── teacher_student/          # 你的实现
+        ├── __init__.py
+        ├── teacher_model.py      # 教师模型
+        ├── student_model.py      # 学生模型
+        └── ...
+
+scripts/
+    └── train_teacher_student.py  # 训练脚本（可选）
+```
+
+这样可以让代码保持 **可复用性** 和 **可维护性**
