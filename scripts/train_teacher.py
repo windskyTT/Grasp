@@ -535,6 +535,8 @@ def run_rollout(
     float,
     float,
 ]:
+    # One explicit reset samples a new Teacher task for this PPO rollout.
+    # Done environments are restored from that cached task by _reset_idx().
     obs_dict, _ = env.reset()
     obs = obs_dict["policy"]
     rollout_reward = torch.zeros((), device=env.device)

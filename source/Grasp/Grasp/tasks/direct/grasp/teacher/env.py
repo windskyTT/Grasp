@@ -920,6 +920,46 @@ class GraspTeacherEnv(DirectRLEnv):
         self.actions[env_ids] = 0.0
         self.delay_mask[env_ids] = False
 
+    def reset(
+        self,
+        seed: int | None = None,
+        options: dict[str, object] | None = None,
+    ) -> tuple[dict[str, torch.Tensor], dict]:
+        """Sample one Teacher task, then reset every environment to it."""
+        if seed is not None:
+            self.seed(seed)
+
+        env_ids = torch.arange(
+            self.num_envs,
+            dtype=torch.long,
+            device=self.device,
+        )
+        self._resample_teacher_rollout_state(env_ids)
+        return super().reset(seed=None, options=options)
+
+    def _resample_teacher_rollout_state(
+        self,
+        env_ids: torch.Tensor,
+    ) -> None:
+        """Generate and cache a new collision-free task for a rollout."""
+        self.selected_pregrasp_candidate[env_ids] = -1
+        sample_collision_free_teacher_resets(
+            env_ids=env_ids,
+            max_reset_rounds=self.cfg.pregrasp.max_reset_rounds,
+            sample_candidates=self._sample_teacher_reset_candidates,
+            check_self_collision=(
+                self._check_teacher_initial_self_collision
+            ),
+        )
+        self.object_position_bias[env_ids] = torch.empty(
+            (env_ids.numel(), 3),
+            dtype=torch.float32,
+            device=self.device,
+        ).uniform_(
+            -self.cfg.reset.biased_position_range,
+            self.cfg.reset.biased_position_range,
+        )
+
     def _reset_idx(
         self,
         env_ids: Sequence[int] | torch.Tensor,
@@ -931,29 +971,11 @@ class GraspTeacherEnv(DirectRLEnv):
         )
         super()._reset_idx(resolved_env_ids)
 
-        self.selected_pregrasp_candidate[resolved_env_ids] = -1
-        sample_collision_free_teacher_resets(
-            env_ids=resolved_env_ids,
-            max_reset_rounds=self.cfg.pregrasp.max_reset_rounds,
-            sample_candidates=self._sample_teacher_reset_candidates,
-            check_self_collision=(
-                self._check_teacher_initial_self_collision
-            ),
-        )
-
         self._write_teacher_reset_state(resolved_env_ids)
         self._refresh_teacher_reset_kinematics()
 
         self.object_initial_root_state[resolved_env_ids] = (
             self.object.data.root_state_w[resolved_env_ids].clone()
-        )
-        self.object_position_bias[resolved_env_ids] = torch.empty(
-            (resolved_env_ids.numel(), 3),
-            dtype=torch.float32,
-            device=self.device,
-        ).uniform_(
-            -self.cfg.reset.biased_position_range,
-            self.cfg.reset.biased_position_range,
         )
         self.object_bias_applied[resolved_env_ids] = False
         wrist_quaternion_w = self.robot.data.body_quat_w[

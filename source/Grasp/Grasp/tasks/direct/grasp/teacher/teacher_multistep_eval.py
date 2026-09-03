@@ -300,7 +300,7 @@ def update_teacher_affordance_visualization(
     if visualizer is None:
         return
     features = env._compute_teacher_observation_features(
-        commit_wrist_history=False,
+        env._teacher_env_ids,
     )
     visualizer.update(env, features)
 

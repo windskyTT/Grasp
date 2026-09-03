@@ -197,6 +197,8 @@ def make_teacher_contact_sensor_cfgs(
         robot_spec.hand_contact_body_names
         + robot_spec.arm_height_body_names
     )
+    # Isaac Lab filtered contact supports one sensor body against many
+    # filter bodies, so each robot body needs its own ContactSensor.
     for body_name in body_names:
         sensor_cfgs[f"contact__{body_name}"] = ContactSensorCfg(
             prim_path=f"{{ENV_REGEX_NS}}/Robot/{body_name}",
