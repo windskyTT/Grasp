@@ -60,8 +60,14 @@ OBJECT_NAMES: tuple[str, ...] = (
     "wood_block_oriented",
 )
 
+PART_NAMES: tuple[str, ...] = ("bottom", "top")
 
-def prepare_import_urdf(object_name: str, temp_root: Path) -> Path:
+
+def prepare_import_urdf(
+    object_name: str,
+    part_name: str,
+    temp_root: Path,
+) -> Path:
     object_dir = DATA_ROOT / object_name
     source_urdf = object_dir / f"{object_name}.urdf"
     tree = ET.parse(source_urdf)
@@ -103,6 +109,11 @@ def prepare_import_urdf(object_name: str, temp_root: Path) -> Path:
             f"{object_name}: rotation child must be top"
         )
 
+    for link_name, link in links.items():
+        if link_name != part_name:
+            robot.remove(link)
+    robot.remove(joint)
+
     robot.set("name", "TeacherObject")
     for mesh in robot.findall(".//mesh"):
         source_mesh = (object_dir / mesh.attrib["filename"]).resolve()
@@ -110,7 +121,9 @@ def prepare_import_urdf(object_name: str, temp_root: Path) -> Path:
 
     prepared_dir = temp_root / "prepared_urdf"
     prepared_dir.mkdir(parents=True, exist_ok=True)
-    prepared_urdf = prepared_dir / f"{object_name}.urdf"
+    prepared_urdf = (
+        prepared_dir / f"{object_name}_{part_name}.urdf"
+    )
     tree.write(prepared_urdf, encoding="utf-8", xml_declaration=True)
     return prepared_urdf
 
@@ -118,43 +131,61 @@ def prepare_import_urdf(object_name: str, temp_root: Path) -> Path:
 def collision_prims(body_prim: Usd.Prim) -> list[Usd.Prim]:
     return [
         prim
-        for prim in Usd.PrimRange(body_prim,Usd.TraverseInstanceProxies(),)
+        for prim in Usd.PrimRange(
+            body_prim,
+            Usd.TraverseInstanceProxies(),
+        )
         if prim.HasAPI(UsdPhysics.CollisionAPI)
     ]
 
 
-def validate_stage(stage: Usd.Stage, object_name: str) -> None:
+def validate_stage(
+    stage: Usd.Stage,
+    object_name: str,
+    part_name: str,
+) -> None:
     root = stage.GetDefaultPrim()
     if not root or root.GetPath().pathString != "/TeacherObject":
         raise RuntimeError(
-            f"{object_name}: default prim must be /TeacherObject"
-        )
-    if not root.HasAPI(UsdPhysics.ArticulationRootAPI):
-        raise RuntimeError(
-            f"{object_name}: /TeacherObject must be an articulation root"
+            f"{object_name}/{part_name}: "
+            "default prim must be /TeacherObject"
         )
 
-    bottom = stage.GetPrimAtPath("/TeacherObject/bottom")
-    top = stage.GetPrimAtPath("/TeacherObject/top")
-    for body_name, body in (("bottom", bottom), ("top", top)):
-        if not body or not body.HasAPI(UsdPhysics.RigidBodyAPI):
-            raise RuntimeError(
-                f"{object_name}: {body_name} must be a rigid body"
-            )
-        if not body.HasAPI(UsdPhysics.MassAPI):
-            raise RuntimeError(
-                f"{object_name}: {body_name} must retain mass and inertia"
-            )
-
-    bottom_colliders = collision_prims(bottom)
-    top_colliders = collision_prims(top)
-    if bottom_colliders:
+    body = stage.GetPrimAtPath(f"/TeacherObject/{part_name}")
+    if not body or not body.HasAPI(UsdPhysics.RigidBodyAPI):
         raise RuntimeError(
-            f"{object_name}: bottom must remain collision-free"
+            f"{object_name}/{part_name}: "
+            f"{part_name} must be a rigid body"
         )
-    if len(top_colliders) != 1:
+    if not body.HasAPI(UsdPhysics.MassAPI):
         raise RuntimeError(
-            f"{object_name}: top must contain exactly one collider"
+            f"{object_name}/{part_name}: "
+            f"{part_name} must retain mass and inertia"
+        )
+
+    rigid_bodies = [
+        prim
+        for prim in Usd.PrimRange(root)
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI)
+    ]
+    if rigid_bodies != [body]:
+        body_paths = tuple(
+            prim.GetPath().pathString
+            for prim in rigid_bodies
+        )
+        raise RuntimeError(
+            f"{object_name}/{part_name}: expected only "
+            f"{body.GetPath()}, got rigid bodies {body_paths}"
+        )
+
+    colliders = collision_prims(body)
+    if part_name == "bottom" and colliders:
+        raise RuntimeError(
+            f"{object_name}/bottom: bottom must remain collision-free"
+        )
+    if part_name == "top" and len(colliders) != 1:
+        raise RuntimeError(
+            f"{object_name}/top: top must contain exactly one collider"
         )
 
     revolute_joint_prims = [
@@ -162,37 +193,30 @@ def validate_stage(stage: Usd.Stage, object_name: str) -> None:
         for prim in stage.Traverse()
         if prim.IsA(UsdPhysics.RevoluteJoint)
     ]
-    if len(revolute_joint_prims) != 1:
+    if revolute_joint_prims:
         raise RuntimeError(
-            f"{object_name}: expected exactly one revolute joint"
-        )
-    joint_prim = revolute_joint_prims[0]
-    if joint_prim.GetName() != "rotation":
-        raise RuntimeError(
-            f"{object_name}: revolute joint must be named rotation"
-        )
-
-    joint = UsdPhysics.RevoluteJoint(joint_prim)
-    body0_targets = tuple(joint.GetBody0Rel().GetTargets())
-    body1_targets = tuple(joint.GetBody1Rel().GetTargets())
-    if body0_targets != (bottom.GetPath(),):
-        raise RuntimeError(
-            f"{object_name}: rotation body0 must target bottom"
-        )
-    if body1_targets != (top.GetPath(),):
-        raise RuntimeError(
-            f"{object_name}: rotation body1 must target top"
+            f"{object_name}/{part_name}: standalone part must not "
+            "contain a revolute joint"
         )
 
 
-def convert_to_staging(object_name: str, temp_root: Path) -> Path:
-    prepared_urdf = prepare_import_urdf(object_name, temp_root)
-    converter_dir = temp_root / "converter" / object_name
+def convert_to_staging(
+    object_name: str,
+    part_name: str,
+    temp_root: Path,
+) -> Path:
+    prepared_urdf = prepare_import_urdf(
+        object_name,
+        part_name,
+        temp_root,
+    )
+    converter_dir = temp_root / "converter" / object_name / part_name
+    usd_file_name = f"{object_name}_{part_name}.usd"
     converter = UrdfConverter(
         UrdfConverterCfg(
             asset_path=str(prepared_urdf),
             usd_dir=str(converter_dir),
-            usd_file_name="teacher_object.usd",
+            usd_file_name=usd_file_name,
             fix_base=False,
             merge_fixed_joints=False,
             force_usd_conversion=True,
@@ -208,11 +232,11 @@ def convert_to_staging(object_name: str, temp_root: Path) -> Path:
         raise RuntimeError(
             f"{object_name}: failed to open converted USD"
         )
-    validate_stage(converted_stage, object_name)
+    validate_stage(converted_stage, object_name, part_name)
 
     staged_dir = temp_root / "flattened" / object_name
     staged_dir.mkdir(parents=True, exist_ok=True)
-    staged_path = staged_dir / "teacher_object.usd"
+    staged_path = staged_dir / usd_file_name
     flattened_layer = converted_stage.Flatten()
     if not flattened_layer.Export(str(staged_path)):
         raise RuntimeError(
@@ -224,14 +248,19 @@ def convert_to_staging(object_name: str, temp_root: Path) -> Path:
         raise RuntimeError(
             f"{object_name}: failed to reopen flattened USD"
         )
-    validate_stage(staged_stage, object_name)
+    validate_stage(staged_stage, object_name, part_name)
     return staged_path
 
 
 def main() -> None:
     output_paths = {
-        object_name: DATA_ROOT / object_name / "teacher_object.usd"
+        (object_name, part_name): (
+            DATA_ROOT
+            / object_name
+            / f"{object_name}_{part_name}.usd"
+        )
         for object_name in OBJECT_NAMES
+        for part_name in PART_NAMES
     }
     existing_outputs = [
         output_path
@@ -249,13 +278,20 @@ def main() -> None:
     ) as temp_dir:
         temp_root = Path(temp_dir)
         staged_paths = {
-            object_name: convert_to_staging(object_name, temp_root)
+            (object_name, part_name): convert_to_staging(
+                object_name,
+                part_name,
+                temp_root,
+            )
             for object_name in OBJECT_NAMES
+            for part_name in PART_NAMES
         }
         for object_name in OBJECT_NAMES:
-            output_path = output_paths[object_name]
-            shutil.copy2(staged_paths[object_name], output_path)
-            print(f"generated {output_path}")
+            for part_name in PART_NAMES:
+                output_key = (object_name, part_name)
+                output_path = output_paths[output_key]
+                shutil.copy2(staged_paths[output_key], output_path)
+                print(f"generated {output_path}")
 
 
 if __name__ == "__main__":

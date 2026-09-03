@@ -158,12 +158,12 @@ def sample_teacher_object_pose(
     object_pose_w[:, 6] = torch.sin(0.5 * yaw)
     return object_pose_w
 
+
 def sample_teacher_stable_object_pose(
     env_origins: torch.Tensor,
     stable_states: torch.Tensor,
     support_height: float,
     source_support_height: float,
-    clearance: float,
     workspace_center_y: float,
     cfg: TeacherResetCfg,
 ) -> torch.Tensor:
@@ -189,11 +189,9 @@ def sample_teacher_stable_object_pose(
         + support_height
         + stable_states[:, 2]
         - source_support_height
-        + clearance
     )
     object_pose_w[:, 3:7] = stable_states[:, 3:7]
     return object_pose_w
-
 
 
 def sample_collision_free_teacher_resets(

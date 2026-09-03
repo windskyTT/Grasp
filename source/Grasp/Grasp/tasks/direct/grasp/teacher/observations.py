@@ -128,7 +128,6 @@ def build_teacher_observation(
     wrist_delta_euler: torch.Tensor,
     wrist_euler: torch.Tensor,
     affordance_vector_world: torch.Tensor,
-    clip_value: float,
 ) -> torch.Tensor:
     batch_size = active_qpos.shape[0]
     flattened_affordance_vector = (
@@ -137,7 +136,7 @@ def build_teacher_observation(
             spec.affordance_vector_dim,
         )
     )
-    observation = torch.cat(
+    return torch.cat(
         (
             active_qpos,
             joint_target_error,
@@ -151,11 +150,6 @@ def build_teacher_observation(
             flattened_affordance_vector,
         ),
         dim=-1,
-    )
-    return torch.clamp(
-        observation,
-        min=-clip_value,
-        max=clip_value,
     )
 
 

@@ -12,12 +12,14 @@ from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.utils import configclass
 
+from .object_pair_spawner import TeacherObjectPairSpawnerCfg
 from .object_set import (
     NEW_TRAINING_SET_ROOT,
     TEACHER_FULL_ENV_COUNT,
     TEACHER_OBJECT_NAMES,
+    TEACHER_WEIGHTED_OBJECT_BOTTOM_USD_PATHS,
     TEACHER_WEIGHTED_OBJECT_INDICES,
-    TEACHER_WEIGHTED_OBJECT_USD_PATHS,
+    TEACHER_WEIGHTED_OBJECT_TOP_USD_PATHS,
 )
 from .observations import TEACHER_OBSERVATION_SPEC
 from .robot_cfg import (
@@ -26,14 +28,12 @@ from .robot_cfg import (
     make_teacher_robot_cfg,
 )
 
-
 TEACHER_CONTACT_FILTER_PRIM_PATHS = (
     "{ENV_REGEX_NS}/Object/top",
     "{ENV_REGEX_NS}/Object/bottom",
     "{ENV_REGEX_NS}/Table",
     "{ENV_REGEX_NS}/Mat",
     "{ENV_REGEX_NS}/WoodenTable",
-    "{ENV_REGEX_NS}/Robot/.*",
 )
 
 TEACHER_DEFAULT_FRICTION = 0.8
@@ -45,16 +45,17 @@ TEACHER_RESTITUTION = 0.0
 class TeacherAssetCfg:
     dataset_root: str = str(NEW_TRAINING_SET_ROOT)
     object_names: tuple[str, ...] = TEACHER_OBJECT_NAMES
-    object_usd_paths: tuple[str, ...] = (
-        TEACHER_WEIGHTED_OBJECT_USD_PATHS
+    object_top_usd_paths: tuple[str, ...] = (
+        TEACHER_WEIGHTED_OBJECT_TOP_USD_PATHS
+    )
+    object_bottom_usd_paths: tuple[str, ...] = (
+        TEACHER_WEIGHTED_OBJECT_BOTTOM_USD_PATHS
     )
     weighted_object_indices: tuple[int, ...] = (
         TEACHER_WEIGHTED_OBJECT_INDICES
     )
     stable_state_paths: tuple[str, ...] = ()
     stable_state_source_support_height: float = 0.773
-    stable_state_clearance: float = 0.005
-
 
 
 @configclass
@@ -87,6 +88,9 @@ class TeacherResetCfg:
     source_to_fr3_angle_offset: float = 0.5 * math.pi
     local_y_range: tuple[float, float] = (-0.25, 0.25)
     yaw_range: tuple[float, float] = (-math.pi, math.pi)
+    biased: bool = False
+    biased_distance_threshold: float = 0.07
+    biased_position_range: float = 0.05
 
 
 @configclass
@@ -104,6 +108,8 @@ class TeacherPregraspCfg:
     posture_score_coeff: float = 1.0
     posture_joint_index: int = 5
     posture_joint_target: float = 1.6
+    posture_limit_target: float = 3.2
+    posture_limit_score_coeff: float = 0.5
     ik_damping: float = 0.05
     ik_step_scale: float = 0.5
     ik_max_iterations: int = 64
@@ -200,6 +206,7 @@ def make_teacher_contact_sensor_cfgs(
             track_pose=False,
             track_contact_points=False,
             track_friction_forces=True,
+            max_contact_data_count_per_prim=128,
             track_air_time=False,
             filter_prim_paths_expr=list(
                 TEACHER_CONTACT_FILTER_PRIM_PATHS
@@ -238,6 +245,7 @@ def make_static_box_cfg(
             rot=(1.0, 0.0, 0.0, 0.0),
         ),
     )
+
 
 def make_teacher_table_cfg(
     geometry: TeacherGeometryCfg,
@@ -287,7 +295,6 @@ def make_teacher_wooden_table_cfg(
     )
 
 
-
 @configclass
 class GraspTeacherEnvCfg(DirectRLEnvCfg):
     robot_spec: TeacherRobotSpec = FR3_INSPIRE_TEACHER_SPEC
@@ -298,13 +305,12 @@ class GraspTeacherEnvCfg(DirectRLEnvCfg):
     pregrasp: TeacherPregraspCfg = TeacherPregraspCfg()
     reward: TeacherRewardCfg = TeacherRewardCfg()
 
-    decimation: int = 12
-    episode_length_s: float = 70 * 0.01667 * decimation
+    decimation: int = 20
+    episode_length_s: float = 70 * 0.01 * decimation
     is_finite_horizon: bool = False
     action_space: int = 13
     observation_space: int = TEACHER_OBSERVATION_SPEC.teacher_dim
     state_space: int = 0
-    clip_observations: float = 5.0
 
     enable_grid_ground: bool = True
     grid_ground_prim_path: str = "/World/GridGround"
@@ -324,7 +330,7 @@ class GraspTeacherEnvCfg(DirectRLEnvCfg):
     )
 
     sim: SimulationCfg = SimulationCfg(
-        dt=0.01667,
+        dt=0.01,
         render_interval=decimation,
         gravity=(0.0, 0.0, -9.81),
         physics_material=make_teacher_default_material_cfg(),
@@ -341,7 +347,7 @@ class GraspTeacherEnvCfg(DirectRLEnvCfg):
         env_spacing=1.2,
         replicate_physics=False,
         clone_in_fabric=False,
-        lazy_sensor_update=False,
+        lazy_sensor_update=True,
     )
     viewer: ViewerCfg = ViewerCfg(
         eye=(1.55, -1.65, 1.35),
@@ -356,9 +362,14 @@ class GraspTeacherEnvCfg(DirectRLEnvCfg):
     )
     object: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Object",
-        spawn=sim_utils.MultiUsdFileCfg(
-            usd_path=list(TEACHER_WEIGHTED_OBJECT_USD_PATHS),
-            random_choice=False,
+        articulation_root_prim_path="/bottom",
+        spawn=TeacherObjectPairSpawnerCfg(
+            top_usd_paths=list(
+                TEACHER_WEIGHTED_OBJECT_TOP_USD_PATHS
+            ),
+            bottom_usd_paths=list(
+                TEACHER_WEIGHTED_OBJECT_BOTTOM_USD_PATHS
+            ),
             activate_contact_sensors=True,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
@@ -386,6 +397,7 @@ class GraspTeacherEnvCfg(DirectRLEnvCfg):
         ),
         actuators={},
     )
+
     table: RigidObjectCfg = make_teacher_table_cfg(
         TeacherGeometryCfg()
     )
@@ -397,11 +409,9 @@ class GraspTeacherEnvCfg(DirectRLEnvCfg):
             TeacherGeometryCfg()
         )
     )
-    contact_sensors: dict[str, ContactSensorCfg] = (
-            make_teacher_contact_sensor_cfgs(
-                FR3_INSPIRE_TEACHER_SPEC,
-            )
-        )
+    contact_sensors: dict[str, ContactSensorCfg] = make_teacher_contact_sensor_cfgs(
+        FR3_INSPIRE_TEACHER_SPEC,
+    )
 
     def __post_init__(self) -> None:
         self.table = make_teacher_table_cfg(self.geometry)
@@ -409,8 +419,6 @@ class GraspTeacherEnvCfg(DirectRLEnvCfg):
         self.wooden_table = (
             make_teacher_wooden_table_cfg(self.geometry)
         )
-
-    
 
 
 __all__ = [

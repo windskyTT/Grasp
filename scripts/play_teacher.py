@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import sys
+from dataclasses import asdict
 
 from isaaclab.app import AppLauncher
 
@@ -32,6 +32,11 @@ parser.add_argument("--episodes", type=int, default=None)
 parser.add_argument("--seed", type=int, default=1)
 parser.add_argument("--lift_delta_z", type=float, default=0.005)
 parser.add_argument("--dls_damping", type=float, default=0.05)
+parser.add_argument(
+    "--biased",
+    action="store_true",
+    default=False,
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
@@ -41,7 +46,6 @@ simulation_app = app_launcher.app
 
 
 import gymnasium as gym
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -63,8 +67,9 @@ from Grasp.tasks.direct.grasp.teacher.teacher_multistep_eval import (
     resolve_teacher_object_selection,
     run_teacher_evaluation_episode,
 )
-
-
+from Grasp.tasks.direct.grasp.teacher.visualization import (
+    TeacherAffordanceVisualizer,
+)
 
 GRASP_TEACHER_CHECKPOINT_VERSION = 1
 GRASP_TEACHER_TASK_ID = "Grasp-Teacher-Direct-v0"
@@ -76,13 +81,6 @@ GRASP_TEACHER_PLAY_KEYS = (
     "algorithm_name",
     "grasp_steps",
 )
-
-
-def tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
-    return tensor.detach().cpu().numpy().astype(
-        np.float32,
-        copy=False,
-    )
 
 
 def serialize_teacher_observation_spec(env) -> dict[str, int]:
@@ -119,7 +117,6 @@ def validate_arguments() -> None:
         )
 
 
-
 def build_actor(env, agent_cfg, seed: int):
     if agent_cfg.activation != "lrelu":
         raise RuntimeError(
@@ -136,7 +133,6 @@ def build_actor(env, agent_cfg, seed: int):
         ),
         ppo_teacher.MultivariateGaussianDiagonalCovariance(
             env.cfg.action_space,
-            env.num_envs,
             agent_cfg.init_std,
             ppo_teacher.TorchNormalSampler(env.cfg.action_space),
             seed=seed,
@@ -232,9 +228,9 @@ def load_actor_checkpoint(
         checkpoint["actor_distribution_state_dict"],
         strict=True,
     )
-    actor.update()
     actor.architecture.architecture.eval()
     print(f"loaded Teacher playback checkpoint: {path}")
+
 
 def main() -> None:
     validate_arguments()
@@ -270,6 +266,7 @@ def main() -> None:
     )
 
     env_cfg.seed = seed
+    env_cfg.reset.biased = args_cli.biased
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
     env_cfg.episode_length_s = (
@@ -277,10 +274,14 @@ def main() -> None:
         * env_cfg.sim.dt
         * env_cfg.decimation
     )
-
     env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
     try:
         assert_teacher_evaluation_contract(env)
+        visualizer = (
+            TeacherAffordanceVisualizer()
+            if args_cli.mode == "visual"
+            else None
+        )
         actor = build_actor(env, agent_cfg, seed)
         load_actor_checkpoint(
             path=args_cli.checkpoint,
@@ -300,6 +301,7 @@ def main() -> None:
                 lift_steps=mode.lift_steps,
                 lift_delta_z=args_cli.lift_delta_z,
                 damping=args_cli.dls_damping,
+                visualizer=visualizer,
             )
             totals.add_episode(env_object_names, episode)
             attempts = episode.success.numel()
@@ -323,7 +325,6 @@ def main() -> None:
         )
     finally:
         env.close()
-
 
 
 if __name__ == "__main__":

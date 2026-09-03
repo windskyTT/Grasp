@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
-from datetime import datetime
 import json
 import os
 import sys
+import time
+from dataclasses import asdict
+from datetime import datetime
 
 from isaaclab.app import AppLauncher
 
@@ -28,6 +29,11 @@ parser.add_argument("--run_name", type=str, default=None)
 parser.add_argument("--seed", type=int, default=1)
 parser.add_argument(
     "--torch_deterministic",
+    action="store_true",
+    default=False,
+)
+parser.add_argument(
+    "--biased",
     action="store_true",
     default=False,
 )
@@ -55,7 +61,6 @@ simulation_app = app_launcher.app
 
 
 import gymnasium as gym
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -97,11 +102,11 @@ GRASP_TEACHER_RESUME_KEYS = (
 )
 
 
-def tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
-    return tensor.detach().cpu().numpy().astype(
-        np.float32,
-        copy=False,
-    )
+def format_duration(seconds: float) -> str:
+    total_seconds = int(seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def serialize_teacher_observation_spec(env) -> dict[str, int]:
@@ -137,7 +142,6 @@ def build_actor_critic(env, agent_cfg, seed: int):
         ),
         ppo_teacher.MultivariateGaussianDiagonalCovariance(
             action_dim,
-            env.num_envs,
             agent_cfg.init_std,
             ppo_teacher.TorchNormalSampler(action_dim),
             seed=seed,
@@ -359,8 +363,6 @@ def load_checkpoint(
             f"ppo={ppo_learning_rate}, path={path}"
         )
 
-    actor.update()
-
     start_update = get_resume_start_update(
         checkpoint,
         role="Teacher resume",
@@ -379,7 +381,6 @@ def load_checkpoint(
         f"next_update={start_update}"
     )
     return start_update
-
 
 
 def create_log_dir(agent_cfg) -> str:
@@ -527,53 +528,90 @@ def run_rollout(
     ppo,
     grasp_steps: int,
     collect_for_update: bool,
-) -> tuple[np.ndarray, float, dict[str, float]]:
+) -> tuple[
+    torch.Tensor,
+    float,
+    dict[str, float],
+    float,
+    float,
+]:
     obs_dict, _ = env.reset()
-    obs = tensor_to_numpy(obs_dict["policy"])
-    rollout_reward = 0.0
-    log_sums: dict[str, float] = {}
+    obs = obs_dict["policy"]
+    rollout_reward = torch.zeros((), device=env.device)
+    log_sums: dict[str, torch.Tensor] = {}
+    episode_rewards = torch.zeros(env.num_envs, device=env.device)
+    episode_lengths = torch.zeros(
+        env.num_envs,
+        dtype=torch.int32,
+        device=env.device,
+    )
+    completed_reward_sum = torch.zeros((), device=env.device)
+    completed_length_sum = torch.zeros((), device=env.device)
+    completed_episode_count = torch.zeros((), device=env.device)
 
     for _ in range(grasp_steps):
-        action_numpy = ppo.act(obs)
-        action_tensor = torch.from_numpy(action_numpy).to(
-            device=env.device,
-            dtype=torch.float32,
-        )
-        next_obs_dict, reward, terminated, _, extras = env.step(
-            action_tensor
+        action = ppo.act(obs)
+        next_obs_dict, reward, terminated, truncated, extras = env.step(
+            action
         )
 
-        reward_numpy = tensor_to_numpy(reward)
-        done_numpy = (
-            terminated.detach()
-            .cpu()
-            .numpy()
-            .astype(
-                np.bool_,
-                copy=False,
-            )
-        )
+        episode_rewards += reward
+        episode_lengths += 1
+        episode_done = terminated | truncated
+        completed_reward_sum += torch.where(
+            episode_done,
+            episode_rewards,
+            0.0,
+        ).sum()
+        completed_length_sum += torch.where(
+            episode_done,
+            episode_lengths,
+            0,
+        ).sum()
+        completed_episode_count += episode_done.sum()
+        episode_rewards.masked_fill_(episode_done, 0.0)
+        episode_lengths.masked_fill_(episode_done, 0)
 
         if collect_for_update:
             ppo.step(
                 value_obs=obs,
-                rews=reward_numpy,
-                dones=done_numpy,
+                rews=reward,
+                dones=terminated,
             )
 
         for name, value in extras["log"].items():
             if name not in log_sums:
-                log_sums[name] = 0.0
-            log_sums[name] += float(value.detach().item())
+                log_sums[name] = torch.zeros((), device=env.device)
+            log_sums[name] += value.detach()
 
-        obs = tensor_to_numpy(next_obs_dict["policy"])
-        rollout_reward += float(reward_numpy.mean())
+        obs = next_obs_dict["policy"]
+        rollout_reward += reward.mean()
+
+    remaining = episode_lengths > 0
+    completed_reward_sum += torch.where(
+        remaining,
+        episode_rewards,
+        0.0,
+    ).sum()
+    completed_length_sum += torch.where(
+        remaining,
+        episode_lengths,
+        0,
+    ).sum()
+    completed_episode_count += remaining.sum()
 
     mean_logs = {
-        name: value / grasp_steps
+        name: (value / grasp_steps).item()
         for name, value in log_sums.items()
     }
-    return obs, rollout_reward / grasp_steps, mean_logs
+    return (
+        obs,
+        (rollout_reward / grasp_steps).item(),
+        mean_logs,
+        (completed_reward_sum / completed_episode_count).item(),
+        (completed_length_sum / completed_episode_count).item(),
+    )
+
 
 def run_periodic_evaluation(
     env,
@@ -628,7 +666,6 @@ def run_periodic_evaluation(
     return metrics
 
 
-
 def write_training_logs(
     ppo,
     update: int,
@@ -661,6 +698,67 @@ def write_evaluation_logs(
         )
 
 
+def print_teacher_iteration(
+    update: int,
+    max_iterations: int,
+    steps_per_iteration: int,
+    collection_time: float,
+    learning_time: float,
+    mean_std: float,
+    mean_value_loss: float,
+    mean_surrogate_loss: float,
+    mean_entropy: float,
+    mean_episode_reward: float,
+    mean_episode_length: float,
+    total_timesteps: int,
+    learning_rate: float,
+    elapsed_time: float,
+    eta: float,
+) -> None:
+    width = 80
+    iteration_time = collection_time + learning_time
+    steps_per_second = int(steps_per_iteration / iteration_time)
+    title = (
+        f"Learning iteration {update + 1}/{max_iterations}"
+    )
+
+    print("#" * width)
+    print(f"{title:^{width}}")
+    print()
+    print(
+        f"{'Computation:':>30} {steps_per_second} steps/s "
+        f"(collection: {collection_time:.3f}s, "
+        f"learning: {learning_time:.3f}s)"
+    )
+    print(f"{'Mean action noise std:':>30} {mean_std:.4f}")
+    print(
+        f"{'Mean value function loss:':>30} "
+        f"{mean_value_loss:.4f}"
+    )
+    print(
+        f"{'Mean surrogate loss:':>30} "
+        f"{mean_surrogate_loss:.4f}"
+    )
+    print(f"{'Mean entropy loss:':>30} {mean_entropy:.4f}")
+    print(
+        f"{'Mean reward:':>30} {mean_episode_reward:.4f}"
+    )
+    print(
+        f"{'Mean episode length:':>30} "
+        f"{mean_episode_length:.2f}"
+    )
+    print("-" * width)
+    print(f"{'Total timesteps:':>30} {total_timesteps}")
+    print(f"{'Learning rate:':>30} {learning_rate:.8f}")
+    print(f"{'Iteration time:':>30} {iteration_time:.2f}s")
+    print(
+        f"{'Time elapsed:':>30} "
+        f"{format_duration(elapsed_time)}"
+    )
+    print(f"{'ETA:':>30} {format_duration(eta)}")
+    print()
+
+
 def main() -> None:
     seed = configure_seed(
         args_cli.seed,
@@ -688,6 +786,7 @@ def main() -> None:
         )
 
     env_cfg.seed = seed
+    env_cfg.reset.biased = args_cli.biased
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
     if args_cli.num_envs is not None:
@@ -745,16 +844,29 @@ def main() -> None:
 
     last_update = start_update - 1
     last_saved_update = start_update - 1
+    training_start_time = time.perf_counter()
+    completed_updates = 0
+    steps_per_iteration = env.num_envs * agent_cfg.grasp_steps
 
     for update in range(
         start_update,
         agent_cfg.max_iterations,
     ):
-        final_obs, mean_reward, mean_logs = run_rollout(
+        collection_start_time = time.perf_counter()
+        (
+            final_obs,
+            mean_reward,
+            mean_logs,
+            mean_episode_reward,
+            mean_episode_length,
+        ) = run_rollout(
             env=env,
             ppo=ppo,
             grasp_steps=agent_cfg.grasp_steps,
             collect_for_update=True,
+        )
+        collection_time = (
+            time.perf_counter() - collection_start_time
         )
         if ppo.storage.step != agent_cfg.grasp_steps:
             raise RuntimeError(
@@ -764,16 +876,23 @@ def main() -> None:
                 f"required={agent_cfg.grasp_steps}"
             )
 
-        ppo.update(
+        learning_start_time = time.perf_counter()
+        ppo_metrics = ppo.update(
             actor_obs=final_obs,
             value_obs=final_obs,
-            log_this_iteration=(update % 10 == 0),
+            log_this_iteration=True,
             update=update,
         )
+        learning_time = time.perf_counter() - learning_start_time
         if ppo.check_exploding_gradient():
             raise RuntimeError(
                 f"Exploding gradient detected at update {update}"
             )
+        (
+            mean_value_loss,
+            mean_surrogate_loss,
+            mean_entropy,
+        ) = ppo_metrics
 
         min_std = torch.full(
             (env.cfg.action_space,),
@@ -782,7 +901,6 @@ def main() -> None:
             device=env.device,
         )
         actor.distribution.enforce_minimum_std(min_std)
-        actor.update()
 
         write_training_logs(
             ppo,
@@ -790,12 +908,30 @@ def main() -> None:
             mean_reward,
             mean_logs,
         )
-        print(
-            f"update={update} "
-            f"average_reward={mean_reward:.6f} "
-            "mean_std="
-            f"{actor.distribution.std.mean().item():.6f} "
-            f"learning_rate={ppo.learning_rate:.8f}"
+        completed_updates += 1
+        elapsed_time = time.perf_counter() - training_start_time
+        remaining_updates = agent_cfg.max_iterations - update - 1
+        eta = (
+            elapsed_time
+            / completed_updates
+            * remaining_updates
+        )
+        print_teacher_iteration(
+            update=update,
+            max_iterations=agent_cfg.max_iterations,
+            steps_per_iteration=steps_per_iteration,
+            collection_time=collection_time,
+            learning_time=learning_time,
+            mean_std=actor.distribution.std.mean().item(),
+            mean_value_loss=mean_value_loss,
+            mean_surrogate_loss=mean_surrogate_loss,
+            mean_entropy=mean_entropy,
+            mean_episode_reward=mean_episode_reward,
+            mean_episode_length=mean_episode_length,
+            total_timesteps=ppo.tot_timesteps,
+            learning_rate=ppo.learning_rate,
+            elapsed_time=elapsed_time,
+            eta=eta,
         )
 
         last_update = update

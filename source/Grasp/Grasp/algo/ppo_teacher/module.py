@@ -16,9 +16,8 @@ class Actor:
         self.action_mean = None
 
     def sample(self, obs):
-        self.action_mean = self.architecture.architecture(obs).cpu().numpy()
-        actions, log_prob = self.distribution.sample(self.action_mean)
-        return actions, log_prob
+        self.action_mean = self.architecture.architecture(obs)
+        return self.distribution.sample(self.action_mean)
 
     def evaluate(self, obs, actions):
         self.action_mean = self.architecture.architecture(obs)
@@ -28,7 +27,7 @@ class Actor:
         return [*self.architecture.parameters(), *self.distribution.parameters()]
 
     def noiseless_action(self, obs):
-        return self.architecture.architecture(torch.from_numpy(obs).to(self.device))
+        return self.architecture.architecture(obs)
 
     def save_deterministic_graph(self, file_name, example_input, device='cpu'):
         transferred_graph = torch.jit.trace(self.architecture.architecture.to(device), example_input)
@@ -37,9 +36,6 @@ class Actor:
 
     def deterministic_parameters(self):
         return self.architecture.parameters()
-
-    def update(self):
-        self.distribution.update()
 
     @property
     def obs_shape(self):
@@ -98,23 +94,16 @@ class MLP(nn.Module):
 
 
 class MultivariateGaussianDiagonalCovariance(nn.Module):
-    def __init__(self, dim, size, init_std, fast_sampler, seed=0):
+    def __init__(self, dim, init_std, fast_sampler, seed=0):
         super(MultivariateGaussianDiagonalCovariance, self).__init__()
         self.dim = dim
         self.std = nn.Parameter(init_std * torch.ones(dim))
         self.distribution = None
         self.fast_sampler = fast_sampler
         self.fast_sampler.seed(seed)
-        self.samples = np.zeros([size, dim], dtype=np.float32)
-        self.logprob = np.zeros(size, dtype=np.float32)
-        self.std_np = self.std.detach().cpu().numpy()
-
-    def update(self):
-        self.std_np = self.std.detach().cpu().numpy()
 
     def sample(self, logits):
-        self.fast_sampler.sample(logits, self.std_np, self.samples, self.logprob)
-        return self.samples.copy(), self.logprob.copy()
+        return self.fast_sampler.sample(logits, self.std)
 
     def evaluate(self, logits, outputs):
         distribution = Normal(logits, self.std.reshape(self.dim))

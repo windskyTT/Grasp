@@ -1,36 +1,40 @@
-import numpy as np
+import math
+
+import torch
 
 
 class TorchNormalSampler:
-    """与 RobustDexGrasp NormalSampler 保持调用接口一致的 NumPy 实现。"""
+    """在策略设备上采样对角高斯动作。"""
 
     def __init__(self, dim: int):
         self.dim = dim
-        self.rng = np.random.default_rng(0)
+        self.seed_value = 0
+        self.generator = None
 
     def seed(self, seed: int) -> None:
-        self.rng = np.random.default_rng(seed)
+        self.seed_value = seed
 
     def sample(
         self,
-        mean: np.ndarray,
-        std: np.ndarray,
-        samples: np.ndarray,
-        logprob: np.ndarray,
-    ) -> None:
-        noise = self.rng.normal(
-            loc=0.0,
-            scale=1.0,
-            size=mean.shape,
-        ).astype(np.float32)
+        mean: torch.Tensor,
+        std: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.generator is None:
+            self.generator = torch.Generator(device=mean.device)
+            self.generator.manual_seed(self.seed_value)
 
-        std_row = std.reshape(1, self.dim)
-        samples[:] = mean + noise * std_row
-
-        normalized = (samples - mean) / std_row
-        logprob[:] = -0.5 * np.sum(
-            normalized**2
-            + 2.0 * np.log(std_row)
-            + np.log(2.0 * np.pi),
-            axis=1,
+        noise = torch.randn(
+            mean.shape,
+            dtype=mean.dtype,
+            device=mean.device,
+            generator=self.generator,
         )
+        std_row = std.reshape(1, self.dim)
+        samples = mean + noise * std_row
+        logprob = -0.5 * torch.sum(
+            noise.square()
+            + 2.0 * torch.log(std_row)
+            + math.log(2.0 * math.pi),
+            dim=1,
+        )
+        return samples, logprob

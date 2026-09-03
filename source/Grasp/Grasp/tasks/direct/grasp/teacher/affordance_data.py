@@ -10,7 +10,6 @@ import trimesh
 from .object_set import (
     NEW_TRAINING_SET_ROOT,
     TEACHER_OBJECT_NAMES,
-    TEACHER_WEIGHTED_OBJECT_INDICES,
 )
 
 
@@ -29,7 +28,8 @@ class TeacherAffordanceFiles:
     top_mesh_path: Path
     bottom_mesh_path: Path
     lowest_point_path: Path
-    teacher_usd_path: Path
+    top_usd_path: Path
+    bottom_usd_path: Path
 
 
 @dataclass(frozen=True)
@@ -49,6 +49,7 @@ class TeacherAffordanceData:
     top_normals_object: torch.Tensor
     bottom_points_object: torch.Tensor
     bottom_normals_object: torch.Tensor
+    stable_states: torch.Tensor | None
 
 
 def _make_affordance_files(
@@ -64,8 +65,12 @@ def _make_affordance_files(
             object_dir / "bottom_watertight_tiny.obj"
         ),
         lowest_point_path=object_dir / "lowest_point_new.txt",
-        teacher_usd_path=object_dir / "teacher_object.usd",
+        top_usd_path=object_dir / f"{object_name}_top.usd",
+        bottom_usd_path=(
+            object_dir / f"{object_name}_bottom.usd"
+        ),
     )
+
 
 TEACHER_AFFORDANCE_FILES: tuple[TeacherAffordanceFiles, ...] = (
     tuple(
@@ -284,8 +289,6 @@ def load_teacher_affordance_data(
         ),
         stable_states=stable_states,
     )
-
-
 
 __all__ = [
     "TEACHER_ROOT_PRIM_PATH",

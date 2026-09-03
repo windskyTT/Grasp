@@ -58,22 +58,22 @@ TEACHER_WEIGHTED_OBJECT_NAMES: tuple[str, ...] = (
     "small_block",
 )
 
-TEACHER_OBJECT_USD_PATHS: tuple[str, ...] = tuple(
-    str(
-        NEW_TRAINING_SET_ROOT
-        / object_name
-        / "teacher_object.usd"
-    )
-    for object_name in TEACHER_OBJECT_NAMES
+TEACHER_OBJECT_TOP_USD_PATHS: tuple[str, ...] = tuple(
+    str(NEW_TRAINING_SET_ROOT / name / f"{name}_top.usd")
+    for name in TEACHER_OBJECT_NAMES
+)
+TEACHER_OBJECT_BOTTOM_USD_PATHS: tuple[str, ...] = tuple(
+    str(NEW_TRAINING_SET_ROOT / name / f"{name}_bottom.usd")
+    for name in TEACHER_OBJECT_NAMES
 )
 
-TEACHER_WEIGHTED_OBJECT_USD_PATHS: tuple[str, ...] = tuple(
-    str(
-        NEW_TRAINING_SET_ROOT
-        / object_name
-        / "teacher_object.usd"
-    )
-    for object_name in TEACHER_WEIGHTED_OBJECT_NAMES
+TEACHER_WEIGHTED_OBJECT_TOP_USD_PATHS: tuple[str, ...] = tuple(
+    str(NEW_TRAINING_SET_ROOT / name / f"{name}_top.usd")
+    for name in TEACHER_WEIGHTED_OBJECT_NAMES
+)
+TEACHER_WEIGHTED_OBJECT_BOTTOM_USD_PATHS: tuple[str, ...] = tuple(
+    str(NEW_TRAINING_SET_ROOT / name / f"{name}_bottom.usd")
+    for name in TEACHER_WEIGHTED_OBJECT_NAMES
 )
 
 TEACHER_OBJECT_INDEX: dict[str, int] = {
@@ -96,12 +96,14 @@ TEACHER_FULL_ENV_COUNT = (
 
 __all__ = [
     "NEW_TRAINING_SET_ROOT",
-    "TEACHER_OBJECT_NAMES",
-    "TEACHER_WEIGHTED_OBJECT_NAMES",
-    "TEACHER_OBJECT_USD_PATHS",
-    "TEACHER_WEIGHTED_OBJECT_USD_PATHS",
-    "TEACHER_OBJECT_INDEX",
-    "TEACHER_WEIGHTED_OBJECT_INDICES",
-    "TEACHER_REPEAT_PER_OBJECT",
     "TEACHER_FULL_ENV_COUNT",
+    "TEACHER_OBJECT_BOTTOM_USD_PATHS",
+    "TEACHER_OBJECT_INDEX",
+    "TEACHER_OBJECT_NAMES",
+    "TEACHER_OBJECT_TOP_USD_PATHS",
+    "TEACHER_REPEAT_PER_OBJECT",
+    "TEACHER_WEIGHTED_OBJECT_BOTTOM_USD_PATHS",
+    "TEACHER_WEIGHTED_OBJECT_INDICES",
+    "TEACHER_WEIGHTED_OBJECT_NAMES",
+    "TEACHER_WEIGHTED_OBJECT_TOP_USD_PATHS",
 ]

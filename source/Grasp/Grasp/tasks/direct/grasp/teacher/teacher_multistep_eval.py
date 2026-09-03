@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 
 from .actions import (
@@ -19,6 +18,7 @@ from .object_set import (
     TEACHER_OBJECT_NAMES,
 )
 from .observations import TEACHER_OBSERVATION_SPEC
+from .visualization import TeacherAffordanceVisualizer
 
 
 SHAPENET_30_ROOT = Path(
@@ -74,7 +74,8 @@ class TeacherEvaluationMode:
 class TeacherObjectSelection:
     mode: TeacherEvaluationMode
     names: tuple[str, ...]
-    usd_paths: tuple[str, ...]
+    top_usd_paths: tuple[str, ...]
+    bottom_usd_paths: tuple[str, ...]
     stable_state_paths: tuple[str, ...]
 
 
@@ -136,13 +137,12 @@ def resolve_teacher_object_selection(
             f"from mode={mode.name}: names={names}, "
             f"unknown={unknown_names}"
         )
-
-    usd_paths = tuple(
-        str(
-            mode.dataset_root
-            / name
-            / "teacher_object.usd"
-        )
+    top_usd_paths = tuple(
+        str(mode.dataset_root / name / f"{name}_top.usd")
+        for name in names
+    )
+    bottom_usd_paths = tuple(
+        str(mode.dataset_root / name / f"{name}_bottom.usd")
         for name in names
     )
     if mode.use_stable_states:
@@ -156,7 +156,8 @@ def resolve_teacher_object_selection(
     return TeacherObjectSelection(
         mode=mode,
         names=names,
-        usd_paths=usd_paths,
+        top_usd_paths=top_usd_paths,
+        bottom_usd_paths=bottom_usd_paths,
         stable_state_paths=stable_state_paths,
     )
 
@@ -170,14 +171,18 @@ def configure_teacher_evaluation_objects(
         selection.mode.dataset_root
     )
     env_cfg.asset.object_names = selection.names
-    env_cfg.asset.object_usd_paths = selection.usd_paths
+    env_cfg.asset.object_top_usd_paths = selection.top_usd_paths
+    env_cfg.asset.object_bottom_usd_paths = selection.bottom_usd_paths
     env_cfg.asset.weighted_object_indices = tuple(
         range(len(selection.names))
     )
     env_cfg.asset.stable_state_paths = (
         selection.stable_state_paths
     )
-    env_cfg.object.spawn.usd_path = list(selection.usd_paths)
+    env_cfg.object.spawn.top_usd_paths = list(selection.top_usd_paths)
+    env_cfg.object.spawn.bottom_usd_paths = list(
+        selection.bottom_usd_paths
+    )
     env_cfg.scene.num_envs = (
         len(selection.names) * repeats_per_object
     )
@@ -288,11 +293,16 @@ def build_multistep_lift_action(
     return torch.cat((arm_action, hand_action), dim=-1)
 
 
-def _tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
-    return tensor.detach().cpu().numpy().astype(
-        np.float32,
-        copy=False,
+def update_teacher_affordance_visualization(
+    env: Any,
+    visualizer: TeacherAffordanceVisualizer | None,
+) -> None:
+    if visualizer is None:
+        return
+    features = env._compute_teacher_observation_features(
+        commit_wrist_history=False,
     )
+    visualizer.update(env, features)
 
 
 def run_teacher_evaluation_episode(
@@ -302,9 +312,11 @@ def run_teacher_evaluation_episode(
     lift_steps: int,
     lift_delta_z: float,
     damping: float,
+    visualizer: TeacherAffordanceVisualizer | None = None,
 ) -> TeacherEvaluationEpisode:
     observation_dict, _ = env.reset()
-    observation = _tensor_to_numpy(observation_dict["policy"])
+    update_teacher_affordance_visualization(env, visualizer)
+    observation = observation_dict["policy"]
     initial_object_z = env.object_initial_root_state[:, 2].clone()
     interrupted = torch.zeros(
         env.num_envs,
@@ -324,6 +336,7 @@ def run_teacher_evaluation_episode(
                 truncated,
                 extras,
             ) = env.step(action)
+            update_teacher_affordance_visualization(env, visualizer)
             interrupted |= terminated | truncated
             reward_sum += float(reward.mean().item())
             for name, value in extras["log"].items():
@@ -331,9 +344,7 @@ def run_teacher_evaluation_episode(
                     log_sums.get(name, 0.0)
                     + float(value.detach().item())
                 )
-            observation = _tensor_to_numpy(
-                next_observation_dict["policy"]
-            )
+            observation = next_observation_dict["policy"]
 
         closed_hand_target = capture_closed_hand_target(env)
         for _ in range(lift_steps):
@@ -344,6 +355,7 @@ def run_teacher_evaluation_episode(
                 damping=damping,
             )
             _, _, terminated, truncated, _ = env.step(lift_action)
+            update_teacher_affordance_visualization(env, visualizer)
             interrupted |= terminated | truncated
 
     lift_height = (
@@ -486,4 +498,5 @@ __all__ = [
     "print_teacher_evaluation_summary",
     "resolve_teacher_object_selection",
     "run_teacher_evaluation_episode",
+    "update_teacher_affordance_visualization",
 ]

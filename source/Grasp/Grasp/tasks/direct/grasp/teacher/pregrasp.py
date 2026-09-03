@@ -6,7 +6,11 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import trimesh
-from isaaclab.utils.math import compute_pose_error
+from isaaclab.utils.math import (
+    compute_pose_error,
+    matrix_from_euler,
+    quat_from_matrix,
+)
 
 from .env_cfg import TeacherPregraspCfg
 
@@ -19,6 +23,27 @@ TeacherKinematicsEvaluator = Callable[
         torch.Tensor,
     ],
 ]
+
+
+FR3_JOINT_ORIGINS_XYZ = (
+    (0.0, 0.0, 0.333),
+    (0.0, 0.0, 0.0),
+    (0.0, -0.316, 0.0),
+    (0.0825, 0.0, 0.0),
+    (-0.0825, 0.384, 0.0),
+    (0.0, 0.0, 0.0),
+    (0.088, 0.0, 0.0),
+)
+FR3_JOINT_ORIGINS_RPY = (
+    (0.0, 0.0, 0.0),
+    (-0.5 * np.pi, 0.0, 0.0),
+    (0.5 * np.pi, 0.0, 0.0),
+    (0.5 * np.pi, 0.0, 0.0),
+    (-0.5 * np.pi, 0.0, 0.0),
+    (0.5 * np.pi, 0.0, 0.0),
+    (0.5 * np.pi, 0.0, 0.0),
+)
+FR3_WRIST_OFFSET = (0.0, 0.0, 0.107)
 
 
 @dataclass(frozen=True)
@@ -210,6 +235,7 @@ def build_teacher_pregrasp_geometry(
     object_position_world: np.ndarray,
     object_rotation_world: np.ndarray,
     env_origin_world: np.ndarray,
+    palm_offset_body: np.ndarray,
     cfg: TeacherPregraspCfg,
 ) -> TeacherPregraspGeometry:
     camera_position_world = (
@@ -246,7 +272,7 @@ def build_teacher_pregrasp_geometry(
             / np.linalg.norm(approach_direction_world)
         )
 
-    wrist_target_position_world = (
+    palm_center_target_world = (
         affordance_center_world
         + cfg.approach_distance * approach_direction_world
     )
@@ -257,11 +283,15 @@ def build_teacher_pregrasp_geometry(
             visible_points_world=visible_points_world,
         )
     )
-    wrist_target_positions_world = np.repeat(
-        wrist_target_position_world.reshape(1, 3),
-        cfg.candidate_count,
-        axis=0,
+    rotated_palm_offsets_world = np.einsum(
+        "nij,j->ni",
+        wrist_target_rotations_world,
+        palm_offset_body,
     )
+    wrist_target_positions_world = (
+        palm_center_target_world.reshape(1, 3)
+        - rotated_palm_offsets_world
+    ).astype(np.float32, copy=False)
 
     return TeacherPregraspGeometry(
         visible_points_world=visible_points_world,
@@ -275,6 +305,116 @@ def build_teacher_pregrasp_geometry(
             wrist_target_rotations_world
         ),
         projection_lengths=projection_lengths,
+    )
+
+
+@torch.no_grad()
+def compute_fr3_wrist_kinematics(
+    arm_qpos: torch.Tensor,
+    robot_base_positions_world: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size = arm_qpos.shape[0]
+    dtype = arm_qpos.dtype
+    device = arm_qpos.device
+
+    joint_origins_xyz = torch.tensor(
+        FR3_JOINT_ORIGINS_XYZ,
+        dtype=dtype,
+        device=device,
+    )
+    joint_origins_rpy = torch.tensor(
+        FR3_JOINT_ORIGINS_RPY,
+        dtype=dtype,
+        device=device,
+    )
+    joint_origin_rotations = matrix_from_euler(
+        joint_origins_rpy,
+        "XYZ",
+    )
+    wrist_offset = torch.tensor(
+        FR3_WRIST_OFFSET,
+        dtype=dtype,
+        device=device,
+    )
+
+    position_world = robot_base_positions_world.clone()
+    rotation_world = torch.eye(
+        3,
+        dtype=dtype,
+        device=device,
+    ).unsqueeze(0).expand(batch_size, -1, -1).clone()
+    joint_positions_world: list[torch.Tensor] = []
+    joint_axes_world: list[torch.Tensor] = []
+
+    for joint_index in range(arm_qpos.shape[1]):
+        position_world = position_world + torch.bmm(
+            rotation_world,
+            joint_origins_xyz[joint_index]
+            .view(1, 3, 1)
+            .expand(batch_size, -1, -1),
+        ).squeeze(-1)
+        rotation_world = torch.bmm(
+            rotation_world,
+            joint_origin_rotations[joint_index]
+            .unsqueeze(0)
+            .expand(batch_size, -1, -1),
+        )
+        joint_positions_world.append(position_world)
+        joint_axes_world.append(rotation_world[:, :, 2])
+
+        joint_angle = arm_qpos[:, joint_index]
+        cosine = torch.cos(joint_angle)
+        sine = torch.sin(joint_angle)
+        zero = torch.zeros_like(joint_angle)
+        one = torch.ones_like(joint_angle)
+        joint_rotation = torch.stack(
+            (
+                cosine,
+                -sine,
+                zero,
+                sine,
+                cosine,
+                zero,
+                zero,
+                zero,
+                one,
+            ),
+            dim=-1,
+        ).reshape(batch_size, 3, 3)
+        rotation_world = torch.bmm(
+            rotation_world,
+            joint_rotation,
+        )
+
+    wrist_position_world = position_world + torch.bmm(
+        rotation_world,
+        wrist_offset.view(1, 3, 1).expand(batch_size, -1, -1),
+    ).squeeze(-1)
+    wrist_quaternion_world = quat_from_matrix(rotation_world)
+
+    joint_positions_world_tensor = torch.stack(
+        joint_positions_world,
+        dim=1,
+    )
+    joint_axes_world_tensor = torch.stack(
+        joint_axes_world,
+        dim=1,
+    )
+    linear_jacobian = torch.linalg.cross(
+        joint_axes_world_tensor,
+        wrist_position_world.unsqueeze(1)
+        - joint_positions_world_tensor,
+        dim=-1,
+    ).transpose(1, 2)
+    angular_jacobian = joint_axes_world_tensor.transpose(1, 2)
+    wrist_jacobian_world = torch.cat(
+        (linear_jacobian, angular_jacobian),
+        dim=1,
+    )
+    return (
+        wrist_position_world,
+        wrist_quaternion_world,
+        wrist_jacobian_world,
     )
 
 
@@ -334,8 +474,6 @@ def solve_fr3_dls_ik(
             torch.linalg.vector_norm(rotation_error, dim=-1)
             <= cfg.ik_rotation_tolerance
         )
-        if torch.all(converged):
-            break
 
         pose_error = torch.cat(
             (position_error, rotation_error),
@@ -392,15 +530,17 @@ def select_teacher_pregrasp_candidate(
     projection_lengths: torch.Tensor,
     cfg: TeacherPregraspCfg,
 ) -> TeacherPregraspSelection:
+    posture_joint = candidate_arm_qpos[
+        :, :, cfg.posture_joint_index
+    ]
     posture_error = torch.abs(
-        candidate_arm_qpos[
-            :, :, cfg.posture_joint_index
-        ]
-        - cfg.posture_joint_target
+        posture_joint - cfg.posture_joint_target
     )
-    short_projection = (
-        projection_lengths < cfg.projection_limit
-    )
+    posture_limit_score = (
+        torch.abs(posture_joint) - cfg.posture_limit_target
+    ) * cfg.posture_score_coeff * cfg.posture_limit_score_coeff
+
+    short_projection = projection_lengths < cfg.projection_limit
     has_short_feasible = torch.any(
         candidate_converged & short_projection,
         dim=1,
@@ -409,7 +549,9 @@ def select_teacher_pregrasp_candidate(
     short_scores = (
         projection_lengths * cfg.length_score_coeff
         + posture_error * cfg.posture_score_coeff
+        + posture_limit_score
     )
+
     large_scores = projection_lengths
     candidate_scores = torch.where(
         has_short_feasible.unsqueeze(-1),
@@ -463,6 +605,7 @@ __all__ = [
     "compute_visible_top_points",
     "sample_rot_mats",
     "build_teacher_pregrasp_geometry",
+    "compute_fr3_wrist_kinematics",
     "compute_damped_least_squares_delta",
     "solve_fr3_dls_ik",
     "select_teacher_pregrasp_candidate",

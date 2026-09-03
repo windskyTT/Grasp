@@ -163,15 +163,17 @@ def make_teacher_robot_cfg(
         actuators={
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=list(spec.arm_joint_names),
-                stiffness=16000.0,
-                damping=600.0,
+                effort_limit_sim=87.0,
+                velocity_limit_sim=2.175,
+                stiffness=400.0,
+                damping=40.0,
                 friction=0.01,
                 armature=0.001,
             ),
             "hand": ImplicitActuatorCfg(
                 joint_names_expr=["right_.*_joint"],
-                stiffness=600.0,
-                damping=20.0,
+                stiffness=100.0,
+                damping=10.0,
                 friction=0.01,
                 armature=0.001,
             ),

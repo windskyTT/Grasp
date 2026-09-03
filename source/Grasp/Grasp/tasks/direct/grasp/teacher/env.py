@@ -32,10 +32,7 @@ from .affordance_data import (
     TEACHER_TOP_BODY_NAME,
     load_teacher_affordance_data,
 )
-from .env_cfg import (
-    TEACHER_CONTACT_FILTER_PRIM_PATHS,
-    GraspTeacherEnvCfg,
-)
+from .env_cfg import GraspTeacherEnvCfg
 from .observations import (
     TEACHER_OBSERVATION_SPEC,
     TeacherObservationFeatures,
@@ -47,6 +44,7 @@ from .observations import (
 
 from .pregrasp import (
     build_teacher_pregrasp_geometry,
+    compute_fr3_wrist_kinematics,
     select_teacher_pregrasp_candidate,
     solve_fr3_dls_ik,
 )
@@ -60,8 +58,6 @@ from .rewards import (
     TEACHER_TERMINAL_REWARD,
     compute_teacher_reward_terms,
 )
-
-
 
 
 class GraspTeacherEnv(DirectRLEnv):
@@ -428,6 +424,16 @@ class GraspTeacherEnv(DirectRLEnv):
         self.object_initial_root_state = torch.zeros_like(
             self.object.data.default_root_state
         )
+        self.object_position_bias = torch.zeros(
+            (self.num_envs, 3),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.object_bias_applied = torch.zeros(
+            self.num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
         self.visible_top_points_object = torch.zeros(
             (
                 self.num_envs,
@@ -518,56 +524,6 @@ class GraspTeacherEnv(DirectRLEnv):
         self.sim.forward()
         self.scene.update(dt=0.0)
 
-    def _evaluate_teacher_pregrasp_kinematics(
-        self,
-        env_ids: torch.Tensor,
-        arm_qpos: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        robot_joint_pos = (
-            self.robot.data.default_joint_pos[env_ids].clone()
-        )
-        robot_joint_pos[:, self.arm_joint_ids] = arm_qpos
-        robot_joint_vel = torch.zeros_like(robot_joint_pos)
-
-        self.robot.write_joint_state_to_sim(
-            robot_joint_pos,
-            robot_joint_vel,
-            env_ids=env_ids,
-        )
-        self.robot.set_joint_position_target(
-            robot_joint_pos,
-            env_ids=env_ids,
-        )
-        self.robot.set_joint_velocity_target(
-            robot_joint_vel,
-            env_ids=env_ids,
-        )
-        self._refresh_teacher_reset_kinematics()
-
-        wrist_position_w = self.robot.data.body_pos_w[
-            env_ids,
-            self.wrist_body_id,
-        ].clone()
-        wrist_quaternion_w = self.robot.data.body_quat_w[
-            env_ids,
-            self.wrist_body_id,
-        ].clone()
-        wrist_jacobian_w = (
-            self.robot.root_physx_view.get_jacobians()[
-                env_ids,
-                self.wrist_jacobian_body_index,
-                0:6,
-                :,
-            ]
-            .index_select(-1, self.arm_joint_ids)
-            .clone()
-        )
-        return (
-            wrist_position_w,
-            wrist_quaternion_w,
-            wrist_jacobian_w,
-        )
-
     def _build_teacher_pregrasp_batch(
         self,
         env_ids: torch.Tensor,
@@ -593,6 +549,22 @@ class GraspTeacherEnv(DirectRLEnv):
             .cpu()
             .numpy()
         )
+        env_ids_cpu = env_ids.detach().cpu()
+        object_indices_cpu = (
+            self.affordance_data.env_object_indices_cpu.index_select(
+                0,
+                env_ids_cpu,
+            )
+        )
+        sampled_top_points_object_cpu = (
+            self.affordance_data.unique_top_points_object_cpu
+            .index_select(0, object_indices_cpu)
+            .numpy()
+        )
+        palm_offset_body_cpu = np.asarray(
+            self.cfg.robot_spec.palm_offset,
+            dtype=np.float32,
+        )
 
         visible_points_w: list[np.ndarray] = []
         visible_points_object: list[np.ndarray] = []
@@ -601,18 +573,15 @@ class GraspTeacherEnv(DirectRLEnv):
         target_rotations_w: list[np.ndarray] = []
         projection_lengths: list[np.ndarray] = []
 
-        for local_index, env_id_value in enumerate(env_ids.tolist()):
+        for local_index, env_id_value in enumerate(
+            env_ids_cpu.tolist()
+        ):
             geometry = build_teacher_pregrasp_geometry(
                 top_mesh=(
                     self.affordance_data.env_top_meshes[env_id_value]
                 ),
                 sampled_top_points_object=(
-                    self.affordance_data.top_points_object[
-                        env_id_value
-                    ]
-                    .detach()
-                    .cpu()
-                    .numpy()
+                    sampled_top_points_object_cpu[local_index]
                 ),
                 object_position_world=object_pose_cpu[
                     local_index,
@@ -622,6 +591,7 @@ class GraspTeacherEnv(DirectRLEnv):
                     local_index
                 ],
                 env_origin_world=env_origins_cpu[local_index],
+                palm_offset_body=palm_offset_body_cpu,
                 cfg=self.cfg.pregrasp,
             )
             visible_points_w.append(geometry.visible_points_world)
@@ -716,9 +686,6 @@ class GraspTeacherEnv(DirectRLEnv):
                     self.cfg.asset
                     .stable_state_source_support_height
                 ),
-                clearance=(
-                    self.cfg.asset.stable_state_clearance
-                ),
                 workspace_center_y=(
                     self.cfg.geometry.center_xy[1]
                 ),
@@ -740,44 +707,52 @@ class GraspTeacherEnv(DirectRLEnv):
         initial_arm_qpos = self.robot.data.default_joint_pos[
             env_ids
         ][:, self.arm_joint_ids]
-        candidate_arm_qpos: list[torch.Tensor] = []
-        candidate_converged: list[torch.Tensor] = []
-
-        for candidate_index in range(
-            self.cfg.pregrasp.candidate_count
-        ):
-            ik_result = solve_fr3_dls_ik(
-                initial_arm_qpos=initial_arm_qpos,
-                target_wrist_position_world=target_positions_w[
-                    :, candidate_index, :
-                ],
-                target_wrist_quaternion_world=target_quaternions_w[
-                    :, candidate_index, :
-                ],
-                arm_lower_limits=self.arm_lower_limits,
-                arm_upper_limits=self.arm_upper_limits,
-                cfg=self.cfg.pregrasp,
-                evaluate_kinematics=(
-                    lambda arm_qpos: (
-                        self._evaluate_teacher_pregrasp_kinematics(
-                            env_ids,
-                            arm_qpos,
-                        )
-                    )
-                ),
-            )
-            candidate_arm_qpos.append(ik_result.arm_qpos)
-            candidate_converged.append(ik_result.converged)
+        candidate_count = self.cfg.pregrasp.candidate_count
+        arm_joint_count = initial_arm_qpos.shape[1]
+        robot_base_positions_world = self.scene.env_origins[env_ids]
+        batched_initial_arm_qpos = (
+            initial_arm_qpos.unsqueeze(1)
+            .expand(-1, candidate_count, -1)
+            .reshape(-1, arm_joint_count)
+        )
+        batched_robot_base_positions_world = (
+            robot_base_positions_world.unsqueeze(1)
+            .expand(-1, candidate_count, -1)
+            .reshape(-1, 3)
+        )
+        ik_result = solve_fr3_dls_ik(
+            initial_arm_qpos=batched_initial_arm_qpos,
+            target_wrist_position_world=target_positions_w.reshape(
+                -1, 3
+            ),
+            target_wrist_quaternion_world=(
+                target_quaternions_w.reshape(-1, 4)
+            ),
+            arm_lower_limits=self.arm_lower_limits,
+            arm_upper_limits=self.arm_upper_limits,
+            cfg=self.cfg.pregrasp,
+            evaluate_kinematics=(
+                lambda arm_qpos: compute_fr3_wrist_kinematics(
+                    arm_qpos=arm_qpos,
+                    robot_base_positions_world=(
+                        batched_robot_base_positions_world
+                    ),
+                )
+            ),
+        )
+        candidate_arm_qpos = ik_result.arm_qpos.reshape(
+            env_ids.numel(),
+            candidate_count,
+            arm_joint_count,
+        )
+        candidate_converged = ik_result.converged.reshape(
+            env_ids.numel(),
+            candidate_count,
+        )
 
         selection = select_teacher_pregrasp_candidate(
-            candidate_arm_qpos=torch.stack(
-                candidate_arm_qpos,
-                dim=1,
-            ),
-            candidate_converged=torch.stack(
-                candidate_converged,
-                dim=1,
-            ),
+            candidate_arm_qpos=candidate_arm_qpos,
+            candidate_converged=candidate_converged,
             projection_lengths=projection_lengths,
             cfg=self.cfg.pregrasp,
         )
@@ -822,17 +797,15 @@ class GraspTeacherEnv(DirectRLEnv):
             selection.selected_candidate_indices[selection.valid]
         )
 
-        self._write_teacher_reset_state(valid_env_ids)
-        self._refresh_teacher_reset_kinematics()
         return selection.valid
 
     def _check_teacher_initial_self_collision(
         self,
         env_ids: torch.Tensor,
     ) -> torch.Tensor:
-        sensor_names = (
-            self.hand_contact_sensor_names
-            + self.arm_contact_sensor_names
+        sensor_names = tuple(
+            f"contact__{body_name}"
+            for body_name in self.cfg.reward.arm_collision_body_names
         )
         for sensor_name in sensor_names:
             self.contact_sensors[sensor_name].reset(env_ids)
@@ -842,39 +815,32 @@ class GraspTeacherEnv(DirectRLEnv):
         self.sim.step(render=False)
         self.scene.update(dt=self.physics_dt)
 
-        robot_filter_index = TEACHER_CONTACT_FILTER_PRIM_PATHS.index(
-            "{ENV_REGEX_NS}/Robot/.*"
-        )
         self_collision = torch.zeros(
             env_ids.numel(),
             dtype=torch.bool,
             device=self.device,
         )
         for sensor_name in sensor_names:
-            force_matrix_w = self.contact_sensors[
+            net_forces_w = self.contact_sensors[
                 sensor_name
-            ].data.force_matrix_w
-            robot_force_w = force_matrix_w[
+            ].data.net_forces_w
+            contact_force_w = net_forces_w[
                 env_ids,
                 0,
-                robot_filter_index:,
                 :,
             ]
-            self_collision |= torch.any(
+            self_collision |= (
                 torch.linalg.vector_norm(
-                    robot_force_w,
+                    contact_force_w,
                     dim=-1,
-                )
-                > 0.0,
-                dim=-1,
+                ) > 0.0
             )
         return self_collision
 
 
-    '''
-    这里必须读取 robot.data.joint_pos，因为 RobustDexGrasp 每个 step 结束后把最新 gc_r_ 作为下一 action mean。
-    不能用 previous_joint_target 代替真实 qpos，否则执行误差会在 target 中累积。
-    '''
+    # 这里必须读取 robot.data.joint_pos，因为 RobustDexGrasp 每个 step
+    # 结束后把最新 gc_r_ 作为下一 action mean。不能用 previous_joint_target
+    # 代替真实 qpos，否则执行误差会在 target 中累积。
     def _pre_physics_step(
         self,
         actions: torch.Tensor,
@@ -921,14 +887,9 @@ class GraspTeacherEnv(DirectRLEnv):
         self._physics_substep = 0
         self._begin_teacher_contact_step()
 
-    
-    '''
-    Isaac Lab 的 DirectRLEnv.step() 会在每个 _apply_action() 后自动调用scene.write_data_to_sim();sim.step();scene.update()
-    '''
+    # Isaac Lab 的 DirectRLEnv.step() 会在每个 _apply_action() 后自动调用
+    # scene.write_data_to_sim()、sim.step() 和 scene.update()。
     def _apply_action(self) -> None:
-        if self._physics_substep > 0:
-            self._accumulate_teacher_contact_substep()
-
         selected_target = select_substep_joint_target(
             current_joint_target=self.current_joint_target,
             previous_joint_target=self.previous_joint_target,
@@ -947,11 +908,7 @@ class GraspTeacherEnv(DirectRLEnv):
             )
         self._physics_substep += 1
 
-
-
-    '''
-    reset 动作状态
-    '''
+    # reset 动作状态
     def _reset_teacher_action_state(
         self,
         env_ids: torch.Tensor,
@@ -962,7 +919,7 @@ class GraspTeacherEnv(DirectRLEnv):
         self.applied_joint_target[env_ids] = current_joint_pos
         self.actions[env_ids] = 0.0
         self.delay_mask[env_ids] = False
-        
+
     def _reset_idx(
         self,
         env_ids: Sequence[int] | torch.Tensor,
@@ -990,6 +947,15 @@ class GraspTeacherEnv(DirectRLEnv):
         self.object_initial_root_state[resolved_env_ids] = (
             self.object.data.root_state_w[resolved_env_ids].clone()
         )
+        self.object_position_bias[resolved_env_ids] = torch.empty(
+            (resolved_env_ids.numel(), 3),
+            dtype=torch.float32,
+            device=self.device,
+        ).uniform_(
+            -self.cfg.reset.biased_position_range,
+            self.cfg.reset.biased_position_range,
+        )
+        self.object_bias_applied[resolved_env_ids] = False
         wrist_quaternion_w = self.robot.data.body_quat_w[
             resolved_env_ids,
             self.wrist_body_id,
@@ -1033,11 +999,9 @@ class GraspTeacherEnv(DirectRLEnv):
             self.support_normal_impulse_vector_w,
             self.support_friction_impulse_vector_w,
             self.support_impulse_vector_w,
-            self.hand_self_impulse_w,
             self.arm_interaction_normal_impulse_w,
             self.arm_interaction_friction_impulse_w,
             self.arm_interaction_impulse_w,
-            self.arm_self_impulse_w,
             self.affordance_contact,
             self.affordance_impulse,
         )
@@ -1050,7 +1014,6 @@ class GraspTeacherEnv(DirectRLEnv):
         for value in self.teacher_reward_terms.values():
             value[env_ids] = 0.0
 
-        self._contact_substeps_accumulated = 0
         self._contact_step_finalized = True
 
 
@@ -1201,6 +1164,37 @@ class GraspTeacherEnv(DirectRLEnv):
             ),
         )
 
+    def _apply_teacher_object_bias(
+        self,
+        features: TeacherObservationFeatures,
+    ) -> None:
+        if not self.cfg.reset.biased:
+            return
+        minimum_distance = torch.min(
+            features.nearest_affordance_distance,
+            dim=1,
+        ).values
+        trigger = (
+            ~self.object_bias_applied
+            & (
+                minimum_distance
+                < self.cfg.reset.biased_distance_threshold
+            )
+        )
+        env_ids = torch.nonzero(trigger, as_tuple=False).squeeze(-1)
+        if env_ids.numel() == 0:
+            return
+
+        object_root_pose = self.object.data.root_state_w[
+            env_ids, 0:7
+        ].clone()
+        object_root_pose[:, 0:3] += self.object_position_bias[env_ids]
+        self.object.write_root_pose_to_sim(
+            object_root_pose,
+            env_ids=env_ids,
+        )
+        self.object_bias_applied[env_ids] = True
+
     def _get_observations(self) -> dict[str, torch.Tensor]:
         features = self._compute_teacher_observation_features(
             commit_wrist_history=True,
@@ -1208,6 +1202,7 @@ class GraspTeacherEnv(DirectRLEnv):
         policy_observation = (
             self._build_teacher_policy_observation(features)
         )
+        self._apply_teacher_object_bias(features)
         self._teacher_step_features = None
         self._teacher_step_observation = None
         return {"policy": policy_observation}
@@ -1254,8 +1249,6 @@ class GraspTeacherEnv(DirectRLEnv):
         self.top_contact_filter_index = 0
         self.bottom_contact_filter_index = 1
         self.support_contact_filter_slice = slice(2, 5)
-        self.robot_contact_filter_start = 5
-
         hand_filter_shape = (
             self.num_envs,
             13,
@@ -1320,10 +1313,6 @@ class GraspTeacherEnv(DirectRLEnv):
         self.support_impulse_vector_w = torch.zeros_like(
             self.top_normal_impulse_vector_w
         )
-        self.hand_self_impulse_w = torch.zeros_like(
-            self.top_normal_impulse_vector_w
-        )
-
         self.arm_interaction_normal_impulse_w = torch.zeros(
             arm_shape,
             dtype=torch.float32,
@@ -1335,9 +1324,6 @@ class GraspTeacherEnv(DirectRLEnv):
             )
         )
         self.arm_interaction_impulse_w = torch.zeros_like(
-            self.arm_interaction_normal_impulse_w
-        )
-        self.arm_self_impulse_w = torch.zeros_like(
             self.arm_interaction_normal_impulse_w
         )
         self.arm_all_contact = torch.zeros(
@@ -1365,7 +1351,6 @@ class GraspTeacherEnv(DirectRLEnv):
             for name in TEACHER_REWARD_TERM_NAMES
         }
 
-        self._contact_substeps_accumulated = 0
         self._contact_step_finalized = True
         self._teacher_step_features = None
         self._teacher_step_observation = None
@@ -1376,15 +1361,15 @@ class GraspTeacherEnv(DirectRLEnv):
         self.arm_normal_impulse_by_filter_w.zero_()
         self.arm_friction_impulse_by_filter_w.zero_()
         self.arm_all_contact.zero_()
-        self._contact_substeps_accumulated = 0
         self._contact_step_finalized = False
 
     def _read_teacher_contact_forces(
         self,
         sensor_names: tuple[str, ...],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         normal_forces_w: list[torch.Tensor] = []
         friction_forces_w: list[torch.Tensor] = []
+        net_forces_w: list[torch.Tensor] = []
         for sensor_name in sensor_names:
             sensor_data = self.contact_sensors[sensor_name].data
             normal_forces_w.append(
@@ -1393,21 +1378,27 @@ class GraspTeacherEnv(DirectRLEnv):
             friction_forces_w.append(
                 sensor_data.friction_forces_w[:, 0, :, :]
             )
+            net_forces_w.append(
+                sensor_data.net_forces_w[:, 0, :]
+            )
         return (
             torch.stack(normal_forces_w, dim=1),
             torch.stack(friction_forces_w, dim=1),
+            torch.stack(net_forces_w, dim=1),
         )
 
     def _accumulate_teacher_contact_substep(self) -> None:
         (
             hand_normal_force_w,
             hand_friction_force_w,
+            _,
         ) = self._read_teacher_contact_forces(
             self.hand_contact_sensor_names
         )
         (
             arm_normal_force_w,
             arm_friction_force_w,
+            arm_net_force_w,
         ) = self._read_teacher_contact_forces(
             self.arm_contact_sensor_names
         )
@@ -1425,21 +1416,12 @@ class GraspTeacherEnv(DirectRLEnv):
             arm_friction_force_w * self.physics_dt
         )
 
-        arm_normal_contact = torch.linalg.vector_norm(
-            arm_normal_force_w,
-            dim=-1,
-        ) > 0.0
-        arm_friction_contact = torch.linalg.vector_norm(
-            arm_friction_force_w,
-            dim=-1,
-        ) > 0.0
         self.arm_all_contact.logical_or_(
-            torch.any(
-                arm_normal_contact | arm_friction_contact,
+            torch.linalg.vector_norm(
+                arm_net_force_w,
                 dim=-1,
-            )
+            ) > 0.0
         )
-        self._contact_substeps_accumulated += 1
 
     def _finalize_teacher_contact_step_data(self) -> None:
         hand_total_impulse_by_filter_w = (
@@ -1454,7 +1436,6 @@ class GraspTeacherEnv(DirectRLEnv):
         top_index = self.top_contact_filter_index
         bottom_index = self.bottom_contact_filter_index
         support_slice = self.support_contact_filter_slice
-        robot_start = self.robot_contact_filter_start
 
         self.top_normal_impulse_vector_w.copy_(
             self.hand_normal_impulse_by_filter_w[
@@ -1503,31 +1484,14 @@ class GraspTeacherEnv(DirectRLEnv):
                 :, :, support_slice, :
             ].sum(dim=2)
         )
-        self.hand_self_impulse_w.copy_(
-            hand_total_impulse_by_filter_w[
-                :, :, robot_start:, :
-            ].sum(dim=2)
-        )
-
         self.arm_interaction_normal_impulse_w.copy_(
-            self.arm_normal_impulse_by_filter_w[
-                :, :, :robot_start, :
-            ].sum(dim=2)
+            self.arm_normal_impulse_by_filter_w.sum(dim=2)
         )
         self.arm_interaction_friction_impulse_w.copy_(
-            self.arm_friction_impulse_by_filter_w[
-                :, :, :robot_start, :
-            ].sum(dim=2)
+            self.arm_friction_impulse_by_filter_w.sum(dim=2)
         )
         self.arm_interaction_impulse_w.copy_(
-            arm_total_impulse_by_filter_w[
-                :, :, :robot_start, :
-            ].sum(dim=2)
-        )
-        self.arm_self_impulse_w.copy_(
-            arm_total_impulse_by_filter_w[
-                :, :, robot_start:, :
-            ].sum(dim=2)
+            arm_total_impulse_by_filter_w.sum(dim=2)
         )
 
         top_total_impulse = torch.linalg.vector_norm(
@@ -1567,7 +1531,6 @@ class GraspTeacherEnv(DirectRLEnv):
             affordance_vector_world=(
                 features.nearest_affordance_vector_world
             ),
-            clip_value=self.cfg.clip_observations,
         )
 
 
@@ -1625,7 +1588,6 @@ class GraspTeacherEnv(DirectRLEnv):
             self.arm_interaction_normal_impulse_w,
             self.arm_interaction_friction_impulse_w,
             self.arm_interaction_impulse_w,
-            self.arm_self_impulse_w,
         )
         for tensor in critical_tensors:
             non_finite |= ~torch.isfinite(

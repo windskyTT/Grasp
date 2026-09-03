@@ -86,23 +86,31 @@ class PPO:
     def act(self, actor_obs, student_driven_ratio=0):
         self.actor_obs = actor_obs
         with torch.no_grad():
-            self.actions, self.actions_log_prob = self.actor.sample(torch.from_numpy(actor_obs).to(self.device))
+            self.actions, self.actions_log_prob = self.actor.sample(actor_obs)
         return self.actions
     
     #功能: 将环境反馈的一步（Transition）存入缓冲区。
     # 保存的数据包括：观测状态、价值状态、动作、策略分布的均值和标准差、奖励 (rews)、环境结束标志 (dones) 以及动作概率
     def step(self, value_obs, rews, dones):
-        self.storage.add_transitions(self.actor_obs, value_obs, self.actions, self.actor.action_mean, self.actor.distribution.std_np, rews, dones,
-                                     self.actions_log_prob)
+        self.storage.add_transitions(
+            self.actor_obs,
+            value_obs,
+            self.actions,
+            self.actor.action_mean,
+            self.actor.distribution.std,
+            rews,
+            dones,
+            self.actions_log_prob,
+        )
         
     #功能: 触发模型参数的更新。
     # 首先，使用当前的 Critic 网络预测最后一个状态的价值 (last_values)。这对于计算不完整轨迹的返回值（Bootstrapping）至关重要
     def update(self, actor_obs, value_obs, log_this_iteration, update):
-        last_values = self.critic.predict(torch.from_numpy(value_obs).to(self.device))
+        last_values = self.critic.predict(value_obs)
 
         # Learning step 调用缓冲区的方法，利用 GAE (Generalized Advantage Estimation) 计算每个状态的优势函数 (Advantage) 和目标回报 (Return)
-        self.storage.compute_returns(last_values.to(self.device), self.critic, self.gamma, self.lam)
-        mean_value_loss, mean_surrogate_loss, infos = self._train_step(log_this_iteration) #_train_step: 调用核心训练逻辑，执行梯度下降
+        self.storage.compute_returns(last_values, self.critic, self.gamma, self.lam)
+        mean_value_loss, mean_surrogate_loss, mean_entropy, infos = self._train_step(log_this_iteration) #_train_step: 调用核心训练逻辑，执行梯度下降
         self.storage.clear() #clear: 训练完成后，清空缓冲区，为下一轮数据收集做准备（因为 PPO 是同策略 On-Policy 算法，旧数据不能重复使用）
 
         #如果训练步骤返回空信息，说明检测到了梯度爆炸，标记状态并提前终止。否则，记录日志
@@ -112,6 +120,7 @@ class PPO:
 
         if log_this_iteration:
             self.log({**locals(), **infos, 'it': update})
+        return mean_value_loss, mean_surrogate_loss, mean_entropy
 
     #功能: 将评估损失、替代损失、动作方差和学习率等关键指标写入 TensorBoard
     def log(self, variables):
@@ -125,8 +134,9 @@ class PPO:
     #对收集到的一批数据，进行 num_learning_epochs 次重复迭代。
     # 每次迭代中，将数据划分为多个 Mini-batch 处理
     def _train_step(self, log_this_iteration):
-        mean_value_loss = 0
-        mean_surrogate_loss = 0
+        mean_value_loss = torch.zeros((), device=self.device)
+        mean_surrogate_loss = torch.zeros((), device=self.device)
+        mean_entropy = torch.zeros((), device=self.device)
         for epoch in range(self.num_learning_epochs):
             for actor_obs_batch, critic_obs_batch, actions_batch, old_sigma_batch, old_mu_batch, current_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch \
                     in self.batch_sampler(self.num_mini_batches):
@@ -194,15 +204,19 @@ class PPO:
                             return None, None, None
 
                 if log_this_iteration:
-                    mean_value_loss += value_loss.item()
-                    mean_surrogate_loss += surrogate_loss.item()
+                    mean_value_loss += value_loss.detach()
+                    mean_surrogate_loss += surrogate_loss.detach()
+                    mean_entropy += entropy_batch.mean().detach()
 
         if log_this_iteration:
             num_updates = self.num_learning_epochs * self.num_mini_batches
-            mean_value_loss /= num_updates
-            mean_surrogate_loss /= num_updates
+            mean_value_loss = (mean_value_loss / num_updates).item()
+            mean_surrogate_loss = (
+                mean_surrogate_loss / num_updates
+            ).item()
+            mean_entropy = (mean_entropy / num_updates).item()
 
-        return mean_value_loss, mean_surrogate_loss, locals()
+        return mean_value_loss, mean_surrogate_loss, mean_entropy, locals()
 
     def check_exploding_gradient(self): #提供一个外部接口，允许训练主循环查询是否发生了梯度爆炸，以便采取重置环境或重新初始化网络的策略
         return self.is_exploding_gradient
