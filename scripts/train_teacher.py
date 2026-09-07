@@ -1,5 +1,18 @@
 
-"""Train the standalone RobustDexGrasp-style Teacher in Isaac Lab."""
+"""Train the standalone RobustDexGrasp-style Teacher in Isaac Lab.
+
+当前 Teacher 固定训练契约：
+    observation = 119
+    action      = 13 = FR3 7 + Inspire active 6
+    rollout     = 70 steps
+    simulator   = cuda:0
+    PPO storage = cuda:0
+    Actor/Critic parameters = 直接在 cuda:0 创建
+
+CPU 仅用于：
+    CLI / 文件路径 / YAML / JSON / TensorBoard / checkpoint I/O / 终端打印。
+这些数据不会重新送回 GPU 参与训练数值计算。
+"""
 
 from __future__ import annotations
 
@@ -12,6 +25,22 @@ from dataclasses import asdict
 from datetime import datetime
 
 from isaaclab.app import AppLauncher
+
+
+# =============================================================================
+# Teacher runtime device contract
+# =============================================================================
+# 当前项目固定使用单张 RTX 3070 Ti，对应 cuda:0。
+#
+# 训练数值链必须保持：
+#     PhysX CUDA
+#     -> observation CUDA
+#     -> Actor/Critic CUDA
+#     -> PPO storage CUDA
+#     -> PPO update CUDA
+#
+# 因此不允许通过 CLI 把训练切回 CPU。
+TEACHER_RUNTIME_DEVICE = "cuda:0"
 
 
 parser = argparse.ArgumentParser(
@@ -55,6 +84,17 @@ parser.add_argument(
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
+
+# AppLauncher 本身也显式使用 cuda:0。
+# 如果用户没有写 --device，就自动设为 cuda:0；
+# 如果写了别的 device，则不允许启动 Teacher training。
+if args_cli.device is None:
+    args_cli.device = TEACHER_RUNTIME_DEVICE
+elif args_cli.device != TEACHER_RUNTIME_DEVICE:
+    raise RuntimeError(
+        "Teacher training requires cuda:0, got "
+        f"{args_cli.device}"
+    )
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -125,6 +165,16 @@ def resolve_resume_path(checkpoint_argument: str) -> str | None:
 
 
 def build_actor_critic(env, agent_cfg, seed: int):
+    """直接在 CUDA 上创建 Actor / Critic 参数。
+
+    ppo_teacher.MLP() 内部会创建 nn.Linear，
+    MultivariateGaussianDiagonalCovariance() 内部会创建 std Parameter。
+
+    如果先普通构造再 Actor(...).to(cuda)，初始权重和 std 会先在 CPU
+    创建，再搬到 GPU。这里用 torch.device(env.device) context，
+    让网络参数和高斯 std 从创建第一刻就在 cuda:0。
+    """
+
     if agent_cfg.activation != "lrelu":
         raise RuntimeError(
             "Teacher activation must remain lrelu, got "
@@ -133,30 +183,33 @@ def build_actor_critic(env, agent_cfg, seed: int):
 
     obs_dim = env.obs_spec.teacher_dim
     action_dim = env.cfg.action_space
-    actor = ppo_teacher.Actor(
-        ppo_teacher.MLP(
-            agent_cfg.policy_net,
-            nn.LeakyReLU,
-            obs_dim,
-            action_dim,
-        ),
-        ppo_teacher.MultivariateGaussianDiagonalCovariance(
-            action_dim,
-            agent_cfg.init_std,
-            ppo_teacher.TorchNormalSampler(action_dim),
-            seed=seed,
-        ),
-        env.device,
-    )
-    critic = ppo_teacher.Critic(
-        ppo_teacher.MLP(
-            agent_cfg.value_net,
-            nn.LeakyReLU,
-            obs_dim,
-            1,
-        ),
-        env.device,
-    )
+
+    with torch.device(env.device):
+        actor = ppo_teacher.Actor(
+            ppo_teacher.MLP(
+                agent_cfg.policy_net,
+                nn.LeakyReLU,
+                obs_dim,
+                action_dim,
+            ),
+            ppo_teacher.MultivariateGaussianDiagonalCovariance(
+                action_dim,
+                agent_cfg.init_std,
+                ppo_teacher.TorchNormalSampler(action_dim),
+                seed=seed,
+            ),
+            env.device,
+        )
+        critic = ppo_teacher.Critic(
+            ppo_teacher.MLP(
+                agent_cfg.value_net,
+                nn.LeakyReLU,
+                obs_dim,
+                1,
+            ),
+            env.device,
+        )
+
     return actor, critic
 
 
@@ -454,6 +507,18 @@ def validate_training_contract(
     obs_dict: dict[str, torch.Tensor],
     agent_cfg,
 ) -> None:
+    """检查 Teacher training 的固定接口和 CUDA 数值边界。"""
+
+    if str(torch.device(env.device)) != TEACHER_RUNTIME_DEVICE:
+        raise RuntimeError(
+            "Teacher environment must run on cuda:0, got "
+            f"{env.device}"
+        )
+
+    if obs_dict["policy"].device.type != "cuda":
+        raise RuntimeError(
+            "Teacher policy observation must be CUDA Tensor"
+        )
     if env.obs_spec.teacher_dim != GRASP_TEACHER_OBSERVATION_DIM:
         raise RuntimeError(
             "Teacher observation spec must be 119, got "
@@ -523,6 +588,7 @@ def validate_training_contract(
         )
 
 
+@torch.no_grad()
 def run_rollout(
     env,
     ppo,
@@ -575,10 +641,13 @@ def run_rollout(
         episode_lengths.masked_fill_(episode_done, 0)
 
         if collect_for_update:
+            # PPO / GAE 的 episode boundary 必须包含 terminated | truncated。
+            # IsaacLab 在 70-step timeout 后会自动 reset；如果只存 terminated，
+            # GAE 会错误地把 reset 后新 episode 的 value 接到旧 episode 上。
             ppo.step(
                 value_obs=obs,
                 rews=reward,
-                dones=terminated,
+                dones=episode_done,
             )
 
         for name, value in extras["log"].items():
@@ -622,7 +691,10 @@ def run_periodic_evaluation(
 ) -> dict[str, float]:
     storage_step_before = ppo.storage.step
     env_object_names = get_teacher_env_object_names(env)
-    totals = TeacherEvaluationTotals(env_object_names)
+    totals = TeacherEvaluationTotals(
+        env_object_names,
+        device=env.device,
+    )
     grasp_reward_sum = 0.0
     grasp_log_sums: dict[str, float] = {}
 
@@ -789,8 +861,9 @@ def main() -> None:
 
     env_cfg.seed = seed
     env_cfg.reset.biased = args_cli.biased
-    if args_cli.device is not None:
-        env_cfg.sim.device = args_cli.device
+
+    # Teacher simulation 与 PPO 固定使用同一张 GPU。
+    env_cfg.sim.device = TEACHER_RUNTIME_DEVICE
     if args_cli.num_envs is not None:
         env_cfg.scene.num_envs = args_cli.num_envs
     if args_cli.max_iterations is not None:
@@ -823,6 +896,14 @@ def main() -> None:
 
     actor, critic = build_actor_critic(env, agent_cfg, seed)
     ppo = build_ppo(env, actor, critic, agent_cfg, log_dir)
+
+    # minimum std 是固定 CUDA 常量，只创建一次，不在每个 update 重复分配。
+    minimum_action_std = torch.full(
+        (env.cfg.action_space,),
+        agent_cfg.min_std,
+        dtype=torch.float32,
+        device=env.device,
+    )
 
     if resume_path is None:
         start_update = 0
@@ -896,13 +977,9 @@ def main() -> None:
             mean_entropy,
         ) = ppo_metrics
 
-        min_std = torch.full(
-            (env.cfg.action_space,),
-            agent_cfg.min_std,
-            dtype=torch.float32,
-            device=env.device,
+        actor.distribution.enforce_minimum_std(
+            minimum_action_std
         )
-        actor.distribution.enforce_minimum_std(min_std)
 
         write_training_logs(
             ppo,
