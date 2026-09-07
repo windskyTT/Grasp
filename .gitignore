@@ -9,14 +9,14 @@
 **/.thumbs
 
 # No USD files allowed in the repo
-**/*.usd
-**/*.usda
-**/*.usdc
-**/*.usdz
-**/*.urdf
-**/*.obj
-**/*.stl 
-**/*.txt
+# **/*.usd
+# **/*.usda
+# **/*.usdc
+# **/*.usdz
+# **/*.urdf
+# **/*.obj
+# **/*.stl 
+# **/*.txt
 
 # Python
 .DS_Store

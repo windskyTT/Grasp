@@ -12,6 +12,7 @@ from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.utils import configclass
 
+from .actions import TEACHER_ACTION_DIM
 from .object_pair_spawner import TeacherObjectPairSpawnerCfg
 from .object_set import (
     NEW_TRAINING_SET_ROOT,
@@ -39,6 +40,22 @@ TEACHER_CONTACT_FILTER_PRIM_PATHS = (
 TEACHER_DEFAULT_FRICTION = 0.8
 TEACHER_SUPPORT_FRICTION = 0.2
 TEACHER_RESTITUTION = 0.0
+
+# =============================================================================
+# Teacher GPU / 时间步硬约束
+# =============================================================================
+TEACHER_SIM_DEVICE = "cuda:0"
+
+# 与原 RobustDexGrasp Teacher 对齐：
+# physics dt = 0.01 s
+# 每个 RL action 执行 20 个 physics substeps
+# 因此 control dt = 0.01 * 20 = 0.2 s
+TEACHER_PHYSICS_DT = 0.01
+TEACHER_DECIMATION = 20
+
+# Teacher grasp rollout 长度为 70 个 policy steps：
+# 70 * 0.2 s = 14 s
+TEACHER_GRASP_STEPS = 70
 
 
 @configclass
@@ -307,10 +324,24 @@ class GraspTeacherEnvCfg(DirectRLEnvCfg):
     pregrasp: TeacherPregraspCfg = TeacherPregraspCfg()
     reward: TeacherRewardCfg = TeacherRewardCfg()
 
-    decimation: int = 20
-    episode_length_s: float = 70 * 0.01 * decimation
+    # -------------------------------------------------------------------------
+    # RL / physics 时间尺度
+    # -------------------------------------------------------------------------
+    # 一个 policy action 对应 TEACHER_DECIMATION 个 PhysX step。
+    decimation: int = TEACHER_DECIMATION
+
+    # 70 policy steps * 20 substeps * 0.01 s = 14 s。
+    episode_length_s: float = (
+        TEACHER_GRASP_STEPS
+        * TEACHER_PHYSICS_DT
+        * TEACHER_DECIMATION
+    )
+
     is_finite_horizon: bool = False
-    action_space: int = 13
+
+    # FR3 7 active DOF + Inspire 6 active DOF = 13。
+    # 直接复用 actions.py 的常量，防止两处配置以后改不同步。
+    action_space: int = TEACHER_ACTION_DIM
     observation_space: int = TEACHER_OBSERVATION_SPEC.teacher_dim
     state_space: int = 0
 
@@ -332,7 +363,12 @@ class GraspTeacherEnvCfg(DirectRLEnvCfg):
     )
 
     sim: SimulationCfg = SimulationCfg(
-        dt=0.01,
+        # 强制 PhysX 使用 CUDA。
+        # 训练数值 tensor 也应由 env.device 继承到同一 CUDA device。
+        device=TEACHER_SIM_DEVICE,
+
+        # PhysX 单步 0.01 s；配合 decimation=20 得到 control_dt=0.2 s。
+        dt=TEACHER_PHYSICS_DT,
         render_interval=decimation,
         gravity=(0.0, 0.0, -9.81),
         physics_material=make_teacher_default_material_cfg(),
@@ -345,6 +381,7 @@ class GraspTeacherEnvCfg(DirectRLEnvCfg):
         ),
     )
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        # 当前 object set 的完整并行环境数量。
         num_envs=TEACHER_FULL_ENV_COUNT,
         env_spacing=1.2,
         replicate_physics=False,
@@ -416,6 +453,8 @@ class GraspTeacherEnvCfg(DirectRLEnvCfg):
     )
 
     def __post_init__(self) -> None:
+        # 只根据最终 geometry 配置重新构造支撑面。
+        # 这里不创建任何训练 tensor，也不存在 CPU -> GPU 数值搬运。
         self.table = make_teacher_table_cfg(self.geometry)
         self.mat = make_teacher_mat_cfg(self.geometry)
         self.wooden_table = (
@@ -424,6 +463,10 @@ class GraspTeacherEnvCfg(DirectRLEnvCfg):
 
 
 __all__ = [
+    "TEACHER_SIM_DEVICE",
+    "TEACHER_PHYSICS_DT",
+    "TEACHER_DECIMATION",
+    "TEACHER_GRASP_STEPS",
     "GraspTeacherEnvCfg",
     "TeacherActionCfg",
     "TeacherAssetCfg",

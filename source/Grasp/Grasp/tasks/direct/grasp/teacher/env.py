@@ -4,7 +4,6 @@ from collections.abc import Sequence
 from copy import deepcopy
 import math
 
-import numpy as np
 import torch
 
 import isaaclab.sim as sim_utils
@@ -43,8 +42,8 @@ from .observations import (
 )
 
 from .pregrasp import (
-    build_teacher_pregrasp_geometry,
-    compute_fr3_wrist_kinematics,
+    build_teacher_pregrasp_geometry_gpu,
+    compute_fr3_palm_kinematics,
     select_teacher_pregrasp_candidate,
     solve_fr3_dls_ik,
 )
@@ -71,6 +70,18 @@ class GraspTeacherEnv(DirectRLEnv):
         render_mode: str | None = None,
         **kwargs,
     ) -> None:
+        # =====================================================================
+        # Teacher GPU contract
+        # =====================================================================
+        # 本项目明确要求 Teacher 的 PhysX 与所有训练数值都运行在 CUDA。
+        # 必须在 super().__init__() 之前检查，因为 DirectRLEnv 初始化时就会
+        # 创建 simulation / scene / articulation。
+        if torch.device(cfg.sim.device).type != "cuda":
+            raise RuntimeError(
+                "GraspTeacherEnv requires CUDA simulation, "
+                f"got cfg.sim.device={cfg.sim.device}"
+            )
+
         super().__init__(cfg, render_mode, **kwargs)
 
         self.obs_spec = TEACHER_OBSERVATION_SPEC
@@ -87,11 +98,20 @@ class GraspTeacherEnv(DirectRLEnv):
             ),
             stable_state_paths=self.cfg.asset.stable_state_paths,
         )
-        self.palm_offset_b = torch.tensor(
+        # palm_offset 是相对于 Inspire base_link 的局部偏移。
+        # Tensor 从创建开始就在 CUDA，绝不先创建 CPU Tensor 再搬到 GPU。
+        self.palm_offset_local_b = torch.tensor(
             self.cfg.robot_spec.palm_offset,
             dtype=torch.float32,
             device=self.device,
-        ).unsqueeze(0).expand(self.num_envs, -1)
+        )
+
+        # observation 需要 [num_envs, 3]。
+        # expand() 只建立 view，不复制一份 N 倍数据。
+        self.palm_offset_b = self.palm_offset_local_b.unsqueeze(0).expand(
+            self.num_envs,
+            -1,
+        )
         self._initialize_teacher_reset_buffers()
         self._initialize_teacher_action_buffers()
         self._initialize_teacher_reward_state()
@@ -117,9 +137,8 @@ class GraspTeacherEnv(DirectRLEnv):
             sensor = ContactSensor(sensor_cfg)
             self.contact_sensors[sensor_name] = sensor
 
+        # Teacher 只允许 CUDA PhysX，因此不保留 CPU collision-filter 分支。
         self.scene.clone_environments(copy_from_source=False)
-        if self.device == "cpu":
-            self.scene.filter_collisions(global_prim_paths=[])
 
         self.scene.articulations["robot"] = self.robot
         self.scene.articulations["object"] = self.object
@@ -286,15 +305,13 @@ class GraspTeacherEnv(DirectRLEnv):
             device=self.device,
         )
 
+        # soft_joint_pos_limits 已经属于 IsaacLab robot.data 的 CUDA buffer。
+        # 直接 clone，避免写出任何“先在别的 device 再 .to(cuda)”的数据路径。
         self.joint_lower_limits = (
-            self.robot.data.soft_joint_pos_limits[0, :, 0]
-            .to(self.device)
-            .clone()
+            self.robot.data.soft_joint_pos_limits[0, :, 0].clone()
         )
         self.joint_upper_limits = (
-            self.robot.data.soft_joint_pos_limits[0, :, 1]
-            .to(self.device)
-            .clone()
+            self.robot.data.soft_joint_pos_limits[0, :, 1].clone()
         )
         self.active_lower_limits = self.joint_lower_limits[
             self.active_joint_ids
@@ -536,124 +553,200 @@ class GraspTeacherEnv(DirectRLEnv):
         torch.Tensor,
         torch.Tensor,
     ]:
+        """在 GPU 上批量构造 Teacher pregrasp geometry。
+
+        旧实现的问题：
+            CUDA object pose
+                -> CPU 数值中转
+                -> CPU mesh / array geometry
+                -> Python 按环境循环
+                -> 再重新构造 CUDA tensor
+
+        新实现：
+            CUDA object pose
+                -> CUDA object rotation
+                -> CUDA object indices
+                -> CUDA sampled affordance points
+                -> Warp CUDA raycast
+                -> Torch CUDA geometry
+                -> CUDA palm targets
+
+        这里仍有一个 Python loop，但它只遍历“唯一物体类型”，不是遍历环境。
+        loop 本身只负责选择对应 Warp mesh；所有几何数值、raycast、projection
+        和 target 计算都留在 GPU。
+        """
+
+        batch_size = env_ids.numel()
+        candidate_count = self.cfg.pregrasp.candidate_count
+
+        # object_pose_w 已经是 reset sampler 直接生成的 CUDA tensor。
         object_rotation_w = matrix_from_quat(
             object_pose_w[:, 3:7]
         )
-        object_pose_cpu = object_pose_w.detach().cpu().numpy()
-        object_rotation_cpu = (
-            object_rotation_w.detach().cpu().numpy()
-        )
-        env_origins_cpu = (
-            self.scene.env_origins[env_ids]
-            .detach()
-            .cpu()
-            .numpy()
-        )
-        env_ids_cpu = env_ids.detach().cpu()
-        object_indices_cpu = (
-            self.affordance_data.env_object_indices_cpu.index_select(
+
+        # 每个当前环境对应哪一种唯一 object。
+        # env_object_indices 在 affordance_data.py 中直接创建在 CUDA。
+        object_indices = (
+            self.affordance_data.env_object_indices.index_select(
                 0,
-                env_ids_cpu,
+                env_ids,
             )
         )
-        sampled_top_points_object_cpu = (
-            self.affordance_data.unique_top_points_object_cpu
-            .index_select(0, object_indices_cpu)
-            .numpy()
-        )
-        palm_offset_body_cpu = np.asarray(
-            self.cfg.robot_spec.palm_offset,
-            dtype=np.float32,
+
+        # 每个环境对应的 200 个 top affordance sampled points。
+        # unique_top_points_object 同样是 GPU surface sampling 的结果。
+        sampled_top_points_object = (
+            self.affordance_data.unique_top_points_object.index_select(
+                0,
+                object_indices,
+            )
         )
 
-        visible_points_w: list[np.ndarray] = []
-        visible_points_object: list[np.ndarray] = []
-        affordance_centers_w: list[np.ndarray] = []
-        target_positions_w: list[np.ndarray] = []
-        target_rotations_w: list[np.ndarray] = []
-        projection_lengths: list[np.ndarray] = []
+        env_origins_w = self.scene.env_origins.index_select(
+            0,
+            env_ids,
+        )
 
-        for local_index, env_id_value in enumerate(
-            env_ids_cpu.tolist()
+        # ---------------------------------------------------------------------
+        # 结果 buffer 直接在 CUDA 上建立。
+        # ---------------------------------------------------------------------
+        visible_points_w = torch.empty(
+            (
+                batch_size,
+                AFFORDANCE_POINT_COUNT,
+                3,
+            ),
+            dtype=object_pose_w.dtype,
+            device=self.device,
+        )
+        visible_points_object = torch.empty_like(
+            visible_points_w
+        )
+        affordance_centers_w = torch.empty(
+            (batch_size, 3),
+            dtype=object_pose_w.dtype,
+            device=self.device,
+        )
+
+        # 注意：这里现在明确是 palm target，不再叫 wrist target。
+        #
+        # 原实现把 base_link 局部 palm_offset 直接当成 fr3_link8 的局部偏移，
+        # 会混淆两个固定连接但坐标系不同的 link。
+        # 新的 pregrasp.py 会让 IK 直接求 palm center / palm orientation，
+        # 由 compute_fr3_palm_kinematics() 正确包含：
+        #
+        #     fr3_link8 -> L_flange -> wrist -> base_link -> palm_offset
+        #
+        target_palm_positions_w = torch.empty(
+            (
+                batch_size,
+                candidate_count,
+                3,
+            ),
+            dtype=object_pose_w.dtype,
+            device=self.device,
+        )
+        target_palm_rotations_w = torch.empty(
+            (
+                batch_size,
+                candidate_count,
+                3,
+                3,
+            ),
+            dtype=object_pose_w.dtype,
+            device=self.device,
+        )
+        projection_lengths = torch.empty(
+            (
+                batch_size,
+                candidate_count,
+            ),
+            dtype=object_pose_w.dtype,
+            device=self.device,
+        )
+
+        # ---------------------------------------------------------------------
+        # 一个 unique object 对应一份 Warp CUDA mesh。
+        #
+        # 不把 object_indices 拉到 CPU，也不使用 env_ids.tolist()。
+        # torch.nonzero() 返回 CUDA index tensor。
+        # ---------------------------------------------------------------------
+        for object_index, top_mesh in enumerate(
+            self.affordance_data.unique_top_meshes
         ):
-            geometry = build_teacher_pregrasp_geometry(
-                top_mesh=(
-                    self.affordance_data.env_top_meshes[env_id_value]
-                ),
+            local_ids = torch.nonzero(
+                object_indices == object_index,
+                as_tuple=False,
+            ).squeeze(-1)
+
+            if local_ids.numel() == 0:
+                continue
+
+            geometry = build_teacher_pregrasp_geometry_gpu(
+                top_mesh=top_mesh,
                 sampled_top_points_object=(
-                    sampled_top_points_object_cpu[local_index]
+                    sampled_top_points_object.index_select(
+                        0,
+                        local_ids,
+                    )
                 ),
-                object_position_world=object_pose_cpu[
-                    local_index,
-                    0:3,
-                ],
-                object_rotation_world=object_rotation_cpu[
-                    local_index
-                ],
-                env_origin_world=env_origins_cpu[local_index],
-                palm_offset_body=palm_offset_body_cpu,
+                object_position_world=(
+                    object_pose_w.index_select(
+                        0,
+                        local_ids,
+                    )[:, 0:3]
+                ),
+                object_rotation_world=(
+                    object_rotation_w.index_select(
+                        0,
+                        local_ids,
+                    )
+                ),
+                env_origin_world=(
+                    env_origins_w.index_select(
+                        0,
+                        local_ids,
+                    )
+                ),
                 cfg=self.cfg.pregrasp,
             )
-            visible_points_w.append(geometry.visible_points_world)
-            visible_points_object.append(
+
+            # 所有 geometry 字段都是 CUDA tensor。
+            visible_points_w[local_ids] = (
+                geometry.visible_points_world
+            )
+            visible_points_object[local_ids] = (
                 geometry.visible_points_object
             )
-            affordance_centers_w.append(
+            affordance_centers_w[local_ids] = (
                 geometry.affordance_center_world
             )
-            target_positions_w.append(
-                geometry.wrist_target_positions_world
+            target_palm_positions_w[local_ids] = (
+                geometry.palm_target_positions_world
             )
-            target_rotations_w.append(
-                geometry.wrist_target_rotations_world
+            target_palm_rotations_w[local_ids] = (
+                geometry.palm_target_rotations_world
             )
-            projection_lengths.append(geometry.projection_lengths)
+            projection_lengths[local_ids] = (
+                geometry.projection_lengths
+            )
 
-        visible_points_w_tensor = torch.as_tensor(
-            np.stack(visible_points_w, axis=0),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        visible_points_object_tensor = torch.as_tensor(
-            np.stack(visible_points_object, axis=0),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        affordance_centers_w_tensor = torch.as_tensor(
-            np.stack(affordance_centers_w, axis=0),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        target_positions_w_tensor = torch.as_tensor(
-            np.stack(target_positions_w, axis=0),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        target_rotation_matrices_w = torch.as_tensor(
-            np.stack(target_rotations_w, axis=0),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        target_quaternions_w_tensor = quat_from_matrix(
-            target_rotation_matrices_w.reshape(-1, 3, 3)
+        # quat_from_matrix 直接在 CUDA 上把 [B,K,3,3] 转为 quaternion。
+        target_palm_quaternions_w = quat_from_matrix(
+            target_palm_rotations_w.reshape(-1, 3, 3)
         ).reshape(
-            env_ids.numel(),
-            self.cfg.pregrasp.candidate_count,
+            batch_size,
+            candidate_count,
             4,
-        )
-        projection_lengths_tensor = torch.as_tensor(
-            np.stack(projection_lengths, axis=0),
-            dtype=torch.float32,
-            device=self.device,
         )
 
         return (
-            visible_points_w_tensor,
-            visible_points_object_tensor,
-            affordance_centers_w_tensor,
-            target_positions_w_tensor,
-            target_quaternions_w_tensor,
-            projection_lengths_tensor,
+            visible_points_w,
+            visible_points_object,
+            affordance_centers_w,
+            target_palm_positions_w,
+            target_palm_quaternions_w,
+            projection_lengths,
         )
 
     def _sample_teacher_reset_candidates(
@@ -696,8 +789,8 @@ class GraspTeacherEnv(DirectRLEnv):
             visible_points_w,
             visible_points_object,
             affordance_centers_w,
-            target_positions_w,
-            target_quaternions_w,
+            target_palm_positions_w,
+            target_palm_quaternions_w,
             projection_lengths,
         ) = self._build_teacher_pregrasp_batch(
             env_ids=env_ids,
@@ -720,22 +813,31 @@ class GraspTeacherEnv(DirectRLEnv):
             .expand(-1, candidate_count, -1)
             .reshape(-1, 3)
         )
+        # ---------------------------------------------------------------------
+        # DLS IK 现在直接对 palm center / palm orientation 求解。
+        #
+        # 这样 IK 的 target frame 与 observation 中的 palm center 定义一致，
+        # 不再把 Inspire base_link 的 palm_offset 错当成 fr3_link8 offset。
+        # ---------------------------------------------------------------------
         ik_result = solve_fr3_dls_ik(
             initial_arm_qpos=batched_initial_arm_qpos,
-            target_wrist_position_world=target_positions_w.reshape(
-                -1, 3
+            target_position_world=(
+                target_palm_positions_w.reshape(-1, 3)
             ),
-            target_wrist_quaternion_world=(
-                target_quaternions_w.reshape(-1, 4)
+            target_quaternion_world=(
+                target_palm_quaternions_w.reshape(-1, 4)
             ),
             arm_lower_limits=self.arm_lower_limits,
             arm_upper_limits=self.arm_upper_limits,
             cfg=self.cfg.pregrasp,
             evaluate_kinematics=(
-                lambda arm_qpos: compute_fr3_wrist_kinematics(
+                lambda arm_qpos: compute_fr3_palm_kinematics(
                     arm_qpos=arm_qpos,
                     robot_base_positions_world=(
                         batched_robot_base_positions_world
+                    ),
+                    palm_offset_body=(
+                        self.palm_offset_local_b
                     ),
                 )
             ),
@@ -841,6 +943,9 @@ class GraspTeacherEnv(DirectRLEnv):
     # 这里必须读取 robot.data.joint_pos，因为 RobustDexGrasp 每个 step
     # 结束后把最新 gc_r_ 作为下一 action mean。不能用 previous_joint_target
     # 代替真实 qpos，否则执行误差会在 target 中累积。
+    #
+    # IsaacLab DirectRLEnv.step() 在进入这里前已经执行 action.to(env.device)，
+    # 所以 actions 本身已经是 CUDA tensor，不需要再次 .to(self.device)。
     def _pre_physics_step(
         self,
         actions: torch.Tensor,
@@ -853,7 +958,7 @@ class GraspTeacherEnv(DirectRLEnv):
 
         policy_actions, active_target = (
             compute_residual_active_target(
-                actions=actions.to(self.device),
+                actions=actions,
                 current_active_qpos=current_active_qpos,
                 active_lower_limits=self.active_lower_limits,
                 active_upper_limits=self.active_upper_limits,
@@ -1271,15 +1376,24 @@ class GraspTeacherEnv(DirectRLEnv):
         self.top_contact_filter_index = 0
         self.bottom_contact_filter_index = 1
         self.support_contact_filter_slice = slice(2, 5)
+        # 根据 robot spec 实际 sensor 数量建立 CUDA buffer，
+        # 避免把 13 / 6 再硬编码一遍。
+        hand_contact_body_count = len(
+            self.hand_contact_sensor_names
+        )
+        arm_contact_body_count = len(
+            self.arm_contact_sensor_names
+        )
+
         hand_filter_shape = (
             self.num_envs,
-            13,
+            hand_contact_body_count,
             self.contact_filter_count,
             3,
         )
         arm_filter_shape = (
             self.num_envs,
-            6,
+            arm_contact_body_count,
             self.contact_filter_count,
             3,
         )
@@ -1304,8 +1418,16 @@ class GraspTeacherEnv(DirectRLEnv):
             )
         )
 
-        hand_shape = (self.num_envs, 13, 3)
-        arm_shape = (self.num_envs, 6, 3)
+        hand_shape = (
+            self.num_envs,
+            hand_contact_body_count,
+            3,
+        )
+        arm_shape = (
+            self.num_envs,
+            arm_contact_body_count,
+            3,
+        )
         self.top_normal_impulse_vector_w = torch.zeros(
             hand_shape,
             dtype=torch.float32,
@@ -1349,13 +1471,19 @@ class GraspTeacherEnv(DirectRLEnv):
             self.arm_interaction_normal_impulse_w
         )
         self.arm_all_contact = torch.zeros(
-            (self.num_envs, 6),
+            (
+                self.num_envs,
+                arm_contact_body_count,
+            ),
             dtype=torch.bool,
             device=self.device,
         )
 
         self.affordance_contact = torch.zeros(
-            (self.num_envs, 13),
+            (
+                self.num_envs,
+                hand_contact_body_count,
+            ),
             dtype=torch.float32,
             device=self.device,
         )
