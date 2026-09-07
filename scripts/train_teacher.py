@@ -17,6 +17,7 @@ CPU 仅用于：
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import os
 import sys
@@ -594,6 +595,7 @@ def run_rollout(
     ppo,
     grasp_steps: int,
     collect_for_update: bool,
+    initial_obs_dict: dict[str, torch.Tensor] | None = None,
 ) -> tuple[
     torch.Tensor,
     float,
@@ -601,9 +603,20 @@ def run_rollout(
     float,
     float,
 ]:
-    # One explicit reset samples a new Teacher task for this PPO rollout.
-    # Done environments are restored from that cached task by _reset_idx().
-    obs_dict, _ = env.reset()
+    # -------------------------------------------------------------
+    # 每个 PPO rollout 只采样一次 Teacher task。
+    #
+    # main() 启动时为了 validate_training_contract 已经执行过一次
+    # env.reset()。第一轮 rollout 直接复用那次 reset 的 observation，
+    # 不再马上把同一批刚生成的 pregrasp task 丢掉并重新 reset。
+    #
+    # 后续 rollout 才在这里正常采样下一批 Teacher task。
+    # -------------------------------------------------------------
+    if initial_obs_dict is None:
+        obs_dict, _ = env.reset()
+    else:
+        obs_dict = initial_obs_dict
+
     obs = obs_dict["policy"]
     rollout_reward = torch.zeros((), device=env.device)
     log_sums: dict[str, torch.Tensor] = {}
@@ -881,9 +894,43 @@ def main() -> None:
 
     resume_path = resolve_resume_path(args_cli.checkpoint)
 
-    env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
-    obs_dict, _ = env.reset()
-    validate_training_contract(env, obs_dict, agent_cfg)
+    # 仅在环境构造和首次 reset 期间输出等待位置，不终止训练。
+    # DirectRLEnv 的 setup 完成日志早于 Teacher 数据加载和首次 reset。
+    startup_traceback_path = "/tmp/grasp_teacher_startup_traceback.log"
+    startup_traceback_file = open(startup_traceback_path, "w", encoding="utf-8")
+    faulthandler.dump_traceback_later(60, repeat=True, file=startup_traceback_file)
+    try:
+        startup_start_time = time.perf_counter()
+        print("[Teacher startup] Creating environment and loading affordance data...", flush=True)
+        env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
+        print(
+            "[Teacher startup] Environment and affordance data ready "
+            f"({time.perf_counter() - startup_start_time:.2f}s). "
+            "Starting first reset (raycast / IK / collision screening)...",
+            flush=True,
+        )
+        reset_start_time = time.perf_counter()
+        print(
+            f"[Teacher startup] If reset waits for 60s, read: {startup_traceback_path}",
+            flush=True,
+        )
+        faulthandler.dump_traceback_later(60, repeat=True, file=startup_traceback_file)
+        # 首次 reset 的 observation 同时用于契约检查和第一个 rollout。
+        initial_rollout_obs_dict, _ = env.reset()
+        print(
+            "[Teacher startup] First reset completed "
+            f"({time.perf_counter() - reset_start_time:.2f}s).",
+            flush=True,
+        )
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+        startup_traceback_file.close()
+
+    validate_training_contract(
+        env,
+        initial_rollout_obs_dict,
+        agent_cfg,
+    )
 
     log_dir = create_log_dir(agent_cfg)
     write_run_config(
@@ -947,7 +994,14 @@ def main() -> None:
             ppo=ppo,
             grasp_steps=agent_cfg.grasp_steps,
             collect_for_update=True,
+            initial_obs_dict=(
+                initial_rollout_obs_dict
+            ),
         )
+
+        # 第一轮使用完 main() 的启动 reset 后，
+        # 后续 iteration 再由 run_rollout() 自己执行一次正常 reset。
+        initial_rollout_obs_dict = None
         collection_time = (
             time.perf_counter() - collection_start_time
         )

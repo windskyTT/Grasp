@@ -375,6 +375,8 @@ def compute_visible_top_points_gpu(
             point_count,
             3,
         )
+        # raycast_mesh 内部先 view(-1, 3)，因此必须在传入前连续化。
+        .contiguous()
     )
 
     # ray 指向对应 sampled top point。
@@ -443,9 +445,15 @@ def sample_rot_mats_gpu(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """批量生成每个环境的 candidate palm rotations。
+    """批量生成每个环境的 candidate end-effector rotations。
 
-    完整保留原 NumPy sample_rot_mats() 的几何逻辑，但改为 Torch CUDA。
+    完整保留原 RobustDexGrasp NumPy sample_rot_mats() 的几何逻辑，
+    这里只做 Torch CUDA 化。
+
+    重要：
+        这里返回的 rotation 仍然保持原 wrist / arm-end candidate
+        orientation 语义；FR3 + Inspire 的 base_link / palm orientation
+        转换在 build_teacher_pregrasp_geometry_gpu() 中统一完成。
 
     输入：
         approach_direction_world:
@@ -677,8 +685,24 @@ def build_teacher_pregrasp_geometry_gpu(
     """纯 GPU 构造一批环境的 pregrasp geometry。
 
     注意：
-        这里的 candidate pose 是 palm/base_link pose，
-        不是 fr3_link8 pose。
+        sample_rot_mats_gpu() 保留原 RobustDexGrasp 的 candidate
+        end-effector / wrist orientation 语义。
+
+        对 FR3 + Inspire，IK 最终约束的是 base_link / palm orientation，
+        因此必须显式加入固定链：
+
+            R_WB,target
+                =
+            R_W8,target @ R_8B
+
+        其中：
+            R_W8,target
+                = sample_rot_mats_gpu() 产生的 candidate orientation
+
+            R_8B
+                = fr3_link8 -> Inspire base_link 固定旋转
+
+        不能把 candidate rotation 直接当成 base_link rotation。
     """
 
     batch_size = object_position_world.shape[0]
@@ -767,7 +791,7 @@ def build_teacher_pregrasp_geometry_gpu(
     )
 
     (
-        palm_target_rotations_world,
+        link8_target_rotations_world,
         projection_lengths,
     ) = sample_rot_mats_gpu(
         approach_direction_world=(
@@ -781,8 +805,54 @@ def build_teacher_pregrasp_geometry_gpu(
         ),
     )
 
+    # -----------------------------------------------------------------
+    # 关键坐标系修正：
+    #
+    # 原 RobustDexGrasp 的 sample_rot_mats() 生成的是机械臂
+    # end-effector / wrist candidate orientation。
+    #
+    # 当前 FR3 + Inspire 的 DLS IK 却直接约束：
+    #     Inspire base_link / palm orientation
+    #
+    # 二者之间存在固定链：
+    #
+    #     fr3_link8
+    #        -> L_flange
+    #        -> wrist
+    #        -> base_link
+    #
+    # 因此：
+    #
+    #     R_WB,target
+    #       =
+    #     R_W8,target @ R_8B
+    #
+    # 旧代码漏掉 R_8B，导致 DLS IK 被要求去追一个错误的
+    # base_link orientation，容易让大量 candidate 64 轮都不收敛。
+    # -----------------------------------------------------------------
+    (
+        _,
+        _,
+        _,
+        _,
+        link8_to_base_rotation,
+        _,
+    ) = _get_fr3_kinematic_constants(
+        object_position_world
+    )
+
+    palm_target_rotations_world = torch.matmul(
+        link8_target_rotations_world,
+        link8_to_base_rotation.view(
+            1,
+            1,
+            3,
+            3,
+        ),
+    )
+
     # 每个 candidate 共用相同 palm center，
-    # 只改变 palm orientation。
+    # 只改变 base_link / palm orientation。
     palm_target_positions_world = (
         palm_center_target_world[:, None, :]
         .expand(

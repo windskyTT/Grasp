@@ -14,7 +14,7 @@ GPU 约定：
     - 不使用 NumPy。
     - 不创建 CPU torch.Tensor。
     - 不执行 GPU <-> CPU 数值转换。
-    - reward weight Tensor 直接创建在输入 reward Tensor 的 CUDA device。
+    - reward weight Tensor 由环境初始化一次，后续复用 CUDA Tensor。
     - Python float / tuple 仅作为静态 reward 配置，不属于运行期采样数据。
 """
 
@@ -79,6 +79,9 @@ def compute_teacher_reward_terms(
     arm_joint_velocity: torch.Tensor,
     arm_height_penalty_indices: torch.Tensor,
     arm_collision_indices: torch.Tensor,
+    geometry_weights: torch.Tensor,
+    contact_weights: torch.Tensor,
+    impulse_upper: torch.Tensor,
     cfg: TeacherRewardCfg,
 ) -> tuple[
     torch.Tensor,
@@ -116,31 +119,6 @@ def compute_teacher_reward_terms(
     """
 
     dtype = nearest_affordance_distance.dtype
-    device = nearest_affordance_distance.device
-
-    # =========================================================================
-    # Reward 常量
-    # =========================================================================
-    # 这些值来自静态 cfg tuple。
-    # torch.tensor(..., device=device) 的第一份 Tensor 就直接位于 CUDA，
-    # 不经过 CPU torch.Tensor。
-    geometry_weights = torch.tensor(
-        cfg.hand_geometry_weights,
-        dtype=dtype,
-        device=device,
-    )
-
-    contact_weights = torch.tensor(
-        cfg.hand_contact_weights,
-        dtype=dtype,
-        device=device,
-    )
-
-    impulse_upper = torch.tensor(
-        cfg.hand_impulse_upper,
-        dtype=dtype,
-        device=device,
-    )
 
     # 13 = 当前 Inspire Teacher hand geometry/contact body 数量。
     # 不再把 13.0 作为散落的 magic number。

@@ -479,98 +479,152 @@ def sample_collision_free_teacher_resets(
     sample_candidates: TeacherResetCandidateSampler,
     check_self_collision: TeacherSelfCollisionChecker,
 ) -> None:
-    """为一批环境反复生成有效且无自碰撞的 Teacher pregrasp。
+    """生成 Teacher pregrasp，并只对失败环境做一次修复。
 
-    每一轮：
-
+    旧迁移版：
         pending envs
             ↓
-        GPU object / pregrasp / IK candidate sampling
+        pregrasp + raycast + 10 candidate + 64-step DLS IK
             ↓
-        candidate_valid
-            ├── False -> 下一轮重新采样
-            └── True
-                  ↓
-              PhysX collision screening
-                  ├── collision -> 下一轮
-                  └── no collision -> 完成
+        collision screening
+            ↓
+        失败后重新执行整套流程
+            ↓
+        最多 max_reset_rounds=32 次
 
-    pending_env_ids / candidate_valid / self_collision
-    全部保持为 CUDA Tensor。
+    这会把一次 reset 最坏放大为：
+        32 × 完整 pregrasp pipeline
 
-    这里保留原来的 max_reset_rounds 固定上限，
-    不改变 reset 算法语义。
+    当前版本改为：
+
+        第 1 阶段：
+            所有 env 只生成一次 candidate
+            + 一次 self-collision screening
+
+        第 2 阶段：
+            只对第 1 阶段失败/碰撞 env
+            再做一次 candidate 修复
+            + 一次 self-collision screening
+
+    因此完整 pregrasp pipeline 最多执行两轮，而不是 32 轮。
+
+    为什么不直接照搬原 Raisim 的“复制同物体正常环境状态”：
+        当前 resets.py 的回调接口只能访问：
+            sample_candidates(env_ids)
+            check_self_collision(env_ids)
+
+        它拿不到 env.py 内部的：
+            reset_robot_joint_pos
+            reset_object_root_state
+            object -> env 分组
+
+        为了遵守本次“只改 pregrasp.py / resets.py / train_teacher.py”
+        的要求，这里不修改 env.py 接口，而采用一次局部重采样作为 repair。
+
+    max_reset_rounds 参数仅保留现有 env.py 调用兼容性；
+    不再控制 32 轮循环。
     """
 
-    pending_env_ids = (
-        env_ids.clone()
+    # =================================================================
+    # Phase 1: 所有环境只做一次完整 pregrasp sampling。
+    # =================================================================
+    candidate_valid = sample_candidates(
+        env_ids
     )
 
-    for _ in range(
-        max_reset_rounds
-    ):
-        # pregrasp geometry + IK candidate selection。
-        candidate_valid = sample_candidates(
-            pending_env_ids
-        )
+    invalid_env_ids = env_ids[
+        ~candidate_valid
+    ]
 
-        invalid_env_ids = (
-            pending_env_ids[
-                ~candidate_valid
-            ]
-        )
+    valid_env_ids = env_ids[
+        candidate_valid
+    ]
 
-        valid_env_ids = (
-            pending_env_ids[
-                candidate_valid
-            ]
-        )
-
-        # numel() 只是 Tensor shape metadata。
-        if valid_env_ids.numel() > 0:
-            self_collision = (
-                check_self_collision(
-                    valid_env_ids
-                )
-            )
-
-            collided_env_ids = (
-                valid_env_ids[
-                    self_collision
-                ]
-            )
-        else:
-            collided_env_ids = (
+    if valid_env_ids.numel() > 0:
+        self_collision = (
+            check_self_collision(
                 valid_env_ids
             )
-
-        # 下一轮只处理：
-        #     IK/pregrasp 无效
-        #     +
-        #     有自碰撞
-        pending_env_ids = torch.cat(
-            (
-                invalid_env_ids,
-                collided_env_ids,
-            ),
-            dim=0,
         )
 
-        if (
-            pending_env_ids.numel()
-            == 0
-        ):
-            return
+        collided_env_ids = (
+            valid_env_ids[
+                self_collision
+            ]
+        )
+    else:
+        collided_env_ids = (
+            valid_env_ids
+        )
 
-    # 不再把 pending env id 数值转换成 Python list。
+    repair_env_ids = torch.cat(
+        (
+            invalid_env_ids,
+            collided_env_ids,
+        ),
+        dim=0,
+    )
+
+    if repair_env_ids.numel() == 0:
+        return
+
+    # =================================================================
+    # Phase 2: 只修复第 1 阶段失败的环境。
     #
-    # 原来的错误路径会把 CUDA env id 数值转成 Python list。
-    # 这对训练结果没有帮助，也不符合本项目的严格 GPU 数值边界。
+    # 不再：
+    #     for _ in range(32)
+    #
+    # 所以不会因为少量 IK / collision failure 把启动 reset 放大几十倍。
+    # =================================================================
+    repair_valid = sample_candidates(
+        repair_env_ids
+    )
+
+    unresolved_env_ids = (
+        repair_env_ids[
+            ~repair_valid
+        ]
+    )
+
+    repaired_valid_env_ids = (
+        repair_env_ids[
+            repair_valid
+        ]
+    )
+
+    if repaired_valid_env_ids.numel() > 0:
+        repaired_self_collision = (
+            check_self_collision(
+                repaired_valid_env_ids
+            )
+        )
+
+        repaired_collision_env_ids = (
+            repaired_valid_env_ids[
+                repaired_self_collision
+            ]
+        )
+    else:
+        repaired_collision_env_ids = (
+            repaired_valid_env_ids
+        )
+
+    remaining_failed_env_ids = torch.cat(
+        (
+            unresolved_env_ids,
+            repaired_collision_env_ids,
+        ),
+        dim=0,
+    )
+
+    if remaining_failed_env_ids.numel() == 0:
+        return
+
+    # 姿态修正后，如果这里仍然失败，应该把它当作真实的
+    # pregrasp/IK 或 collision 问题处理，而不是静默再跑 30 轮。
     raise RuntimeError(
-        "Teacher reset could not produce "
-        "collision-free FR3 + Inspire "
-        "pregrasp states within "
-        f"{max_reset_rounds} reset rounds."
+        "Teacher reset still contains invalid or self-colliding "
+        "FR3 + Inspire pregrasp states after one repair pass."
     )
 
 

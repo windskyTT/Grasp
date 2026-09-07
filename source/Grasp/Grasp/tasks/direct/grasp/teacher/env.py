@@ -995,17 +995,20 @@ class GraspTeacherEnv(DirectRLEnv):
     # Isaac Lab 的 DirectRLEnv.step() 会在每个 _apply_action() 后自动调用
     # scene.write_data_to_sim()、sim.step() 和 scene.update()。
     def _apply_action(self) -> None:
-        selected_target = select_substep_joint_target(
-            current_joint_target=self.current_joint_target,
-            previous_joint_target=self.previous_joint_target,
-            delay_mask=self.delay_mask,
-            physics_substep=self._physics_substep,
-            decimation=self.cfg.decimation,
-        )
-        self.applied_joint_target.copy_(selected_target)
-        self.robot.set_joint_position_target(
-            self.applied_joint_target
-        )
+        # 第 0 子步应用延迟掩码，第 1 子步切换到当前目标。
+        # 后续目标不变；DirectRLEnv 仍在每个子步把保留的目标写入 PhysX。
+        if self._physics_substep < 2:
+            selected_target = select_substep_joint_target(
+                current_joint_target=self.current_joint_target,
+                previous_joint_target=self.previous_joint_target,
+                delay_mask=self.delay_mask,
+                physics_substep=self._physics_substep,
+                decimation=self.cfg.decimation,
+            )
+            self.applied_joint_target.copy_(selected_target)
+            self.robot.set_joint_position_target(
+                self.applied_joint_target
+            )
 
         if self._physics_substep == self.cfg.decimation - 1:
             self.previous_joint_target.copy_(
@@ -1323,12 +1326,17 @@ class GraspTeacherEnv(DirectRLEnv):
         self.object_bias_applied[env_ids] = True
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
-        features = self._compute_teacher_observation_features(
-            commit_wrist_history=True,
-        )
-        policy_observation = (
-            self._build_teacher_policy_observation(features)
-        )
+        # _get_dones() 已生成当前物理状态的特征，_get_rewards() 只读取它。
+        # _reset_idx() 会清空缓存，保证 reset 后返回新状态的观测。
+        if self._teacher_step_features is None:
+            features = self._compute_teacher_observation_features(
+                commit_wrist_history=True,
+            )
+            policy_observation = self._build_teacher_policy_observation(features)
+        else:
+            features = self._teacher_step_features
+            policy_observation = self._teacher_step_observation
+            self.previous_wrist_euler.copy_(features.wrist_euler)
         self._apply_teacher_object_bias(features)
         self._teacher_step_features = None
         self._teacher_step_observation = None
@@ -1336,6 +1344,23 @@ class GraspTeacherEnv(DirectRLEnv):
 
     def _initialize_teacher_reward_state(self) -> None:
         spec = self.cfg.robot_spec
+        # 静态配置只在初始化时传入 GPU，避免每个策略步重复创建。
+        reward_dtype = self.robot.data.joint_pos.dtype
+        self.hand_geometry_weights = torch.tensor(
+            self.cfg.reward.hand_geometry_weights,
+            dtype=reward_dtype,
+            device=self.device,
+        )
+        self.hand_contact_weights = torch.tensor(
+            self.cfg.reward.hand_contact_weights,
+            dtype=reward_dtype,
+            device=self.device,
+        )
+        self.hand_impulse_upper = torch.tensor(
+            self.cfg.reward.hand_impulse_upper,
+            dtype=reward_dtype,
+            device=self.device,
+        )
         self.hand_contact_sensor_names = tuple(
             f"contact__{body_name}"
             for body_name in spec.hand_contact_body_names
@@ -1815,6 +1840,9 @@ class GraspTeacherEnv(DirectRLEnv):
                 arm_collision_indices=(
                     self.arm_collision_indices
                 ),
+                geometry_weights=self.hand_geometry_weights,
+                contact_weights=self.hand_contact_weights,
+                impulse_upper=self.hand_impulse_upper,
                 cfg=self.cfg.reward,
             )
         )
