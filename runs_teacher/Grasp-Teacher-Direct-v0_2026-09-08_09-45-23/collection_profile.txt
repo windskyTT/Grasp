@@ -1,0 +1,88 @@
+Second rollout Python call timings, including blocking native calls.
+CUDA kernel durations are not measured separately; profiling adds overhead.
+         887450 function calls (886327 primitive calls) in 5.883 seconds
+
+   Ordered by: cumulative time
+   List reduced from 427 to 40 due to restriction <40>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+    424/1    0.003    0.000    5.884    5.884 /home/windsky/miniconda3/envs/grasp/lib/python3.11/site-packages/torch/utils/_contextlib.py:113(decorate_context)
+        1    0.010    0.010    5.884    5.884 /home/windsky/project/Grasp/scripts/train_teacher.py:599(run_rollout)
+       70    0.011    0.000    5.741    0.082 /home/windsky/IsaacLab/source/isaaclab/isaaclab/envs/direct_rl_env.py:333(step)
+     1401    0.006    0.000    3.481    0.002 /home/windsky/IsaacLab/source/isaaclab/isaaclab/sim/simulation_context.py:541(step)
+     1401    0.002    0.000    3.454    0.002 /home/windsky/isaacsim/exts/isaacsim.core.api/isaacsim/core/api/simulation_context/simulation_context.py:672(step)
+     1401    0.003    0.000    3.450    0.002 /home/windsky/isaacsim/exts/isaacsim.core.api/isaacsim/core/api/physics_context/physics_context.py:563(_step)
+     1401    3.312    0.002    3.316    0.002 {built-in method omni.physx.bindings._physx.fetch_results}
+       70    0.019    0.000    0.762    0.011 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/env.py:1722(_get_dones)
+     1402    0.015    0.000    0.731    0.001 /home/windsky/IsaacLab/source/isaaclab/isaaclab/scene/interactive_scene.py:479(update)
+       70    0.001    0.000    0.696    0.010 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/env.py:1712(_update_teacher_step_data)
+     1403    0.005    0.000    0.672    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/scene/interactive_scene.py:465(write_data_to_sim)
+     2806    0.016    0.000    0.631    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/assets/articulation/articulation.py:218(write_data_to_sim)
+       70    0.000    0.000    0.604    0.009 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/env.py:1684(_update_teacher_contact_step_data)
+       70    0.004    0.000    0.591    0.008 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/env.py:1565(_accumulate_teacher_contact_substep)
+      140    0.023    0.000    0.584    0.004 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/env.py:1541(_read_teacher_contact_forces)
+    26638    0.563    0.000    0.563    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/sensors/sensor_base.py:184(update)
+     1334    0.002    0.000    0.557    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/sensors/contact_sensor/contact_sensor.py:104(data)
+     1334    0.056    0.000    0.555    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/sensors/sensor_base.py:354(_update_outdated_buffers)
+     1334    0.057    0.000    0.456    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/sensors/contact_sensor/contact_sensor.py:364(_update_buffers_impl)
+     2806    0.246    0.000    0.382    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/assets/articulation/articulation.py:1869(_apply_actuator_model)
+     1334    0.018    0.000    0.259    0.000 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/contact_sensor.py:34(_unpack_contact_buffer_data)
+     2804    0.002    0.000    0.149    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/assets/articulation/articulation.py:266(update)
+     2804    0.002    0.000    0.148    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/assets/articulation/articulation_data.py:97(update)
+     2808    0.098    0.000    0.146    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/assets/articulation/articulation_data.py:771(joint_acc)
+     2806    0.078    0.000    0.111    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/actuators/actuator_pd.py:117(compute)
+     2806    0.005    0.000    0.109    0.000 /home/windsky/isaacsim/extscache/omni.physics.tensors-107.3.26+107.3.3.lx64.r.cp311.u353/omni/physics/tensors/impl/api.py:1830(set_dof_actuation_forces)
+        1    0.000    0.000    0.105    0.105 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/env.py:1031(reset)
+     1401    0.102    0.000    0.102    0.000 {built-in method omni.physx.bindings._physx.simulate}
+        1    0.000    0.000    0.096    0.096 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/env.py:1048(_resample_teacher_rollout_state)
+        1    0.000    0.000    0.096    0.096 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/resets.py:475(sample_collision_free_teacher_resets)
+       71    0.052    0.001    0.091    0.001 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/env.py:1150(_compute_teacher_observation_features)
+     1335    0.021    0.000    0.091    0.000 /home/windsky/isaacsim/extscache/omni.warp.core-1.8.2+lx64/warp/context.py:5801(launch)
+     1334    0.003    0.000    0.088    0.000 /home/windsky/isaacsim/extscache/omni.physics.tensors-107.3.26+107.3.3.lx64.r.cp311.u353/omni/physics/tensors/impl/api.py:5961(get_friction_data)
+        1    0.000    0.000    0.087    0.087 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/env.py:752(_sample_teacher_reset_candidates)
+     1334    0.084    0.000    0.084    0.000 {built-in method omni.physics.tensors.bindings._physicsTensors.get_friction_data}
+        1    0.003    0.003    0.083    0.083 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/pregrasp.py:1235(solve_fr3_dls_ik)
+     5349    0.028    0.000    0.079    0.000 /home/windsky/isaacsim/extscache/omni.warp.core-1.8.2+lx64/warp/torch.py:194(from_torch)
+     7025    0.006    0.000    0.072    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/utils/wrench_composer.py:320(reset)
+       70    0.006    0.000    0.067    0.001 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/env.py:1777(_get_rewards)
+    14030    0.014    0.000    0.065    0.000 /home/windsky/isaacsim/extscache/omni.warp.core-1.8.2+lx64/warp/types.py:2757(zero_)
+
+
+         887450 function calls (886327 primitive calls) in 5.883 seconds
+
+   Ordered by: internal time
+   List reduced from 427 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+     1401    3.312    0.002    3.316    0.002 {built-in method omni.physx.bindings._physx.fetch_results}
+    26638    0.563    0.000    0.563    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/sensors/sensor_base.py:184(update)
+     2806    0.246    0.000    0.382    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/assets/articulation/articulation.py:1869(_apply_actuator_model)
+     1401    0.102    0.000    0.102    0.000 {built-in method omni.physx.bindings._physx.simulate}
+     2808    0.098    0.000    0.146    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/assets/articulation/articulation_data.py:771(joint_acc)
+     1334    0.084    0.000    0.084    0.000 {built-in method omni.physics.tensors.bindings._physicsTensors.get_friction_data}
+     2806    0.078    0.000    0.111    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/actuators/actuator_pd.py:117(compute)
+     1334    0.057    0.000    0.456    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/sensors/contact_sensor/contact_sensor.py:364(_update_buffers_impl)
+     1334    0.056    0.000    0.555    0.000 /home/windsky/IsaacLab/source/isaaclab/isaaclab/sensors/sensor_base.py:354(_update_outdated_buffers)
+       71    0.052    0.001    0.091    0.001 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/env.py:1150(_compute_teacher_observation_features)
+     2806    0.049    0.000    0.049    0.000 {built-in method omni.physics.tensors.bindings._physicsTensors.set_dof_actuation_forces}
+    14559    0.045    0.000    0.045    0.000 {method 'to' of 'torch._C.TensorBase' objects}
+    14030    0.042    0.000    0.044    0.000 /home/windsky/isaacsim/extscache/omni.warp.core-1.8.2+lx64/warp/context.py:2935(<lambda>)
+     2802    0.041    0.000    0.041    0.000 {built-in method omni.physics.tensors.bindings._physicsTensors.get_dof_velocities}
+       65    0.040    0.001    0.061    0.001 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/pregrasp.py:890(compute_fr3_palm_kinematics)
+     1404    0.036    0.000    0.036    0.000 {method 'nonzero' of 'torch._C.TensorBase' objects}
+    11248    0.034    0.000    0.044    0.000 /home/windsky/isaacsim/extscache/omni.physics.tensors-107.3.26+107.3.3.lx64.r.cp311.u353/omni/physics/tensors/impl/frontend_torch.py:75(get_tensor_desc)
+     5349    0.028    0.000    0.079    0.000 /home/windsky/isaacsim/extscache/omni.warp.core-1.8.2+lx64/warp/torch.py:194(from_torch)
+     1820    0.027    0.000    0.027    0.000 {built-in method torch.isfinite}
+     1401    0.026    0.000    0.029    0.000 /home/windsky/isaacsim/exts/isaacsim.core.simulation_manager/isaacsim/core/simulation_manager/impl/simulation_manager.py:373(get_physics_dt)
+     1334    0.023    0.000    0.023    0.000 {built-in method omni.physics.tensors.bindings._physicsTensors.get_net_contact_forces}
+      140    0.023    0.000    0.584    0.004 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/env.py:1541(_read_teacher_contact_forces)
+     1335    0.021    0.000    0.091    0.000 /home/windsky/isaacsim/extscache/omni.warp.core-1.8.2+lx64/warp/context.py:5801(launch)
+     1403    0.021    0.000    0.021    0.000 {built-in method omni.physics.tensors.bindings._physicsTensors.set_dof_position_targets}
+     1403    0.020    0.000    0.020    0.000 {built-in method omni.physics.tensors.bindings._physicsTensors.set_dof_velocity_targets}
+       70    0.019    0.000    0.040    0.001 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/rewards.py:60(compute_teacher_reward_terms)
+       70    0.019    0.000    0.762    0.011 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/env.py:1722(_get_dones)
+     1334    0.018    0.000    0.259    0.000 /home/windsky/project/Grasp/source/Grasp/Grasp/tasks/direct/grasp/teacher/contact_sensor.py:34(_unpack_contact_buffer_data)
+     1403    0.018    0.000    0.018    0.000 {built-in method omni.physics.tensors.bindings._physicsTensors.get_dof_positions}
+     1334    0.018    0.000    0.018    0.000 {built-in method omni.physics.tensors.bindings._physicsTensors.get_contact_force_matrix}
+
+

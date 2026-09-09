@@ -9,9 +9,7 @@ from .math_utils import clamp_tensor
 # =============================================================================
 # FR3：7 个主动关节
 # Inspire：6 个主动关节
-#
-# 因此 Teacher policy 的动作维度为：
-#     7 + 6 = 13
+# 因此 Teacher policy 的动作维度为：7 + 6 = 13
 #
 # Inspire 其余被动关节不由策略直接输出，而是在 build_full_joint_target()
 # 中根据 mimic 关系由对应主动关节计算得到
@@ -28,11 +26,11 @@ def compute_residual_active_target(
     active_upper_limits: torch.Tensor,
     arm_scale: float,
     hand_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]: # 元组[action,active_target]
     """
     把 Teacher 的 13 维策略输出转换为 13 个主动关节的位置目标。
-    控制形式保持 RobustDexGrasp Teacher 的 residual position control：q_target = q_current + action * scale
-    其中：前 7 维：FR3，使用 arm_scale；后 6 维：Inspire 主动关节，使用 hand_scale
+    控制形式保持 RobustDexGrasp Teacher 的 residual position control剩余位置控制：q_target = q_current + action * scale
+    其中：前 7 维：FR3，使用 arm_scale手臂规模；后 6 维：Inspire 主动关节，使用 hand_scale
     """
     active_target = current_active_qpos.clone()
     # FR3 7DOF：q_target_hand = q_current_hand + action_hand * hand_scale

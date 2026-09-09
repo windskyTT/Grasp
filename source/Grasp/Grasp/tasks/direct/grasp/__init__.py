@@ -63,6 +63,18 @@ gym.register(
     },
 )
 
+# Independent RobustDexGrasp original Teacher migration: UR5 + Allegro.
+gym.register(
+    id="Grasp-RobustDexTeacher-UR5-Allegro-v0",
+    entry_point=f"{__name__}.teacher_test.env:RobustDexTeacherEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.teacher_test.env_cfg:RobustDexTeacherEnvCfg"
+        ),
+    },
+)
+
 # Student DAgger/LSTM task.
 gym.register(
     id="Grasp-Student-Direct-v0",
@@ -75,6 +87,5 @@ gym.register(
         ),
     },
 )
-
 
 

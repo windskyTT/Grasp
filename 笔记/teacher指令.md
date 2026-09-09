@@ -28,9 +28,13 @@ python scripts/train_teacher.py \
 3070Ti 8GB 如果出现 CUDA 显存不足，可以降低为：
 
 ```bash
+cd /home/windsky/project/Grasp
+conda activate grasp
+
 python scripts/train_teacher.py \
   --task Grasp-Teacher-Direct-v0 \
-  --num_envs 44 \
+  --num_envs 1 \
+  --max_iterations 20001 \
   --device cuda:0 \
   --headless
 ```
@@ -51,5 +55,20 @@ python scripts/train_teacher.py \
   --headless \
   --checkpoint /home/windsky/project/Grasp/runs_teacher/<运行目录>/full_500_r.pt
 ```
+
+play指令
+```bash
+cd /home/windsky/project/Grasp
+conda activate grasp
+
+python scripts/play_teacher.py \
+  --task Grasp-Teacher-Direct-v0 \
+  --checkpoint /home/windsky/project/Grasp/runs_teacher/Grasp-Teacher-Direct-v0_2026-09-07_23-22-23/full_6000_r.pt \
+  --mode visual \
+  --num_envs 1 \
+  --episodes 150 \
+  --device cuda:0
+
+‵‵‵
 
 当前确认结果包括 Isaac Lab `v2.3.2`、Isaac Sim 5.1.0、Grasp editable 安装、训练依赖和训练入口静态检查通过。本轮遵守项目限制，没有实际启动训练；如果启动后产生报错，将内容写入 `错误.md` 后再让我读取处理。
